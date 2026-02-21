@@ -69,6 +69,6 @@ ignore_empty: false
 
 # other
 scan_timeout: 60 # seconds
-styling: true # extract styling for clarity. You can turn it off to save tokens if only your agent uses it.
+styling: true # better looking output for clarity. You can turn it off to save tokens if only your agent uses it.
 auto_update: true
 auto_copy: false # copy to clipboard after scan
