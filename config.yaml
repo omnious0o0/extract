@@ -1,0 +1,74 @@
+paths:
+  - .git
+  - .hg
+  - .svn
+
+types: {}
+
+extensions:
+  - .log
+  - .tmp
+  - .temp
+  - .cache
+  - .pid
+  - .swp
+  - .swo
+  - .pyc
+  - .pyo
+  - .class
+  - .o
+  - .obj
+  - .a
+  - .so
+  - .dylib
+  - .dll
+  - .exe
+
+names:
+  - node_modules
+  - bower_components
+  - jspm_packages
+  - .pnpm-store
+  - .yarn
+  - .npm
+  - .pnp
+  - .pnp.js
+  - .pnp.cjs
+  - .next
+  - .nuxt
+  - .svelte-kit
+  - .angular
+  - .turbo
+  - .cache
+  - .parcel-cache
+  - .eslintcache
+  - coverage
+  - dist
+  - build
+  - out
+  - target
+  - tmp
+  - temp
+  - logs
+  - __pycache__
+  - .pytest_cache
+  - .mypy_cache
+  - .ruff_cache
+  - .tox
+  - .nox
+  - .venv
+  - venv
+  - env
+  - .idea
+  - .vscode
+  - .DS_Store
+  - Thumbs.db
+
+ignore_hidden: true
+ignore_empty: false
+
+# other
+scan_timeout: 60 # seconds
+styling: true # extract styling for clarity. You can turn it off to save tokens if only your agent uses it.
+auto_update: true
+auto_copy: false # copy to clipboard after scan

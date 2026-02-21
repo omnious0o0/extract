@@ -1,0 +1,1400 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import unicodedata
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+try:
+    _wcwidth_module = importlib.import_module("wcwidth")
+    _wcwidth = getattr(_wcwidth_module, "wcwidth", None)
+except Exception:
+    _wcwidth = None
+
+
+VERSION = "1.0.0"
+PROJECT_REPO = "omnious0o0/omni-extract"
+REMOTE_EXTRACT_URL = os.environ.get(
+    "OMNI_EXTRACT_SOURCE_URL",
+    f"https://raw.githubusercontent.com/{PROJECT_REPO}/main/extract",
+)
+AUTO_UPDATE_INTERVAL_SECONDS = 24 * 60 * 60
+DEFAULT_HTTP_TIMEOUT_SECONDS = 10
+DEFAULT_SCAN_TIMEOUT_SECONDS = 60
+DEFAULT_CONFIG_FILE_NAME = "config.yaml"
+STATE_FILE = Path.home() / ".cache" / "omni-extract" / "state.json"
+ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+CLR_RESET = "\033[0m"
+CLR_BOLD = "\033[1m"
+CLR_DIM = "\033[2m"
+CLR_RED = "\033[31m"
+CLR_GREEN = "\033[32m"
+CLR_YELLOW = "\033[33m"
+CLR_BLUE = "\033[34m"
+CLR_MAGENTA = "\033[35m"
+CLR_CYAN = "\033[36m"
+
+
+@dataclass
+class IgnoreRules:
+    paths: Set[str] = field(default_factory=set)
+    types: Set[str] = field(default_factory=set)
+    extensions: Set[str] = field(default_factory=set)
+    names: Set[str] = field(default_factory=set)
+
+    def merge(self, other: "IgnoreRules") -> "IgnoreRules":
+        return IgnoreRules(
+            paths=self.paths | other.paths,
+            types=self.types | other.types,
+            extensions=self.extensions | other.extensions,
+            names=self.names | other.names,
+        )
+
+
+@dataclass
+class Node:
+    path: Path
+    rel_path: str
+    kind: str
+    size: int
+    mtime: float
+    children: List["Node"] = field(default_factory=list)
+    lines: int = 0
+
+    @property
+    def basename(self) -> str:
+        return self.path.name
+
+
+@dataclass
+class ScanStats:
+    files: int = 0
+    dirs: int = 0
+    links: int = 0
+    hidden: int = 0
+    lines: int = 0
+    size: int = 0
+    largest: Optional[Tuple[str, int]] = None
+    newest: Optional[Tuple[str, float]] = None
+    type_counts: Dict[str, int] = field(default_factory=dict)
+    timed_out: bool = False
+
+
+@dataclass
+class PartialConfig:
+    ignore_rules: IgnoreRules = field(default_factory=IgnoreRules)
+    ignore_hidden: Optional[bool] = None
+    ignore_empty: Optional[bool] = None
+    scan_timeout: Optional[int] = None
+    styling: Optional[bool] = None
+    auto_update: Optional[bool] = None
+    auto_copy: Optional[bool] = None
+
+
+@dataclass
+class RuntimeConfig:
+    ignore_rules: IgnoreRules = field(default_factory=IgnoreRules)
+    ignore_hidden: bool = True
+    ignore_empty: bool = False
+    scan_timeout: int = DEFAULT_SCAN_TIMEOUT_SECONDS
+    styling: bool = True
+    auto_update: bool = True
+    auto_copy: bool = False
+
+
+def current_executable_path() -> Path:
+    script_path = Path(__file__).resolve()
+    if script_path.exists():
+        return script_path
+    return Path(sys.argv[0]).resolve()
+
+
+def read_json_file(path: Path) -> Dict[str, object]:
+    if not path.exists() or not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        return {}
+    return {}
+
+
+def write_json_file(path: Path, payload: Dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
+def parse_bool_token(value: str) -> Optional[bool]:
+    normalized = value.strip().strip('"\'').lower()
+    if normalized in {"true", "1", "yes", "on", "y", "t", "ture"}:
+        return True
+    if normalized in {"false", "0", "no", "off", "n", "f", "flase"}:
+        return False
+    return None
+
+
+def parse_int_token(value: str) -> Optional[int]:
+    cleaned = value.strip().strip('"\'')
+    match = re.match(r"^-?\d+", cleaned)
+    if not match:
+        return None
+    try:
+        return int(match.group(0))
+    except ValueError:
+        return None
+
+
+def has_ignore_rules(rules: IgnoreRules) -> bool:
+    return bool(rules.paths or rules.types or rules.extensions or rules.names)
+
+
+def default_common_ignore_rules() -> IgnoreRules:
+    return IgnoreRules(
+        paths={".git", ".hg", ".svn"},
+        extensions={
+            ".log",
+            ".tmp",
+            ".temp",
+            ".cache",
+            ".pid",
+            ".swp",
+            ".swo",
+            ".pyc",
+            ".pyo",
+            ".class",
+            ".o",
+            ".obj",
+            ".a",
+            ".so",
+            ".dylib",
+            ".dll",
+            ".exe",
+        },
+        names={
+            "node_modules",
+            "bower_components",
+            "jspm_packages",
+            ".pnpm-store",
+            ".yarn",
+            ".npm",
+            ".pnp",
+            ".pnp.js",
+            ".pnp.cjs",
+            ".next",
+            ".nuxt",
+            ".svelte-kit",
+            ".angular",
+            ".turbo",
+            ".cache",
+            ".parcel-cache",
+            ".eslintcache",
+            "coverage",
+            "dist",
+            "build",
+            "out",
+            "target",
+            "tmp",
+            "temp",
+            "logs",
+            "__pycache__",
+            ".pytest_cache",
+            ".mypy_cache",
+            ".ruff_cache",
+            ".tox",
+            ".nox",
+            ".venv",
+            "venv",
+            "env",
+            ".idea",
+            ".vscode",
+            ".DS_Store",
+            "Thumbs.db",
+        },
+    )
+
+
+def add_ignore_item(rules: IgnoreRules, key: str, item: str) -> None:
+    item = item.strip().strip('"\'')
+    if not item:
+        return
+
+    if key == "paths":
+        rules.paths.add(normalize_rel(item))
+    elif key == "types":
+        rules.types.add(item.lower())
+    elif key == "extensions":
+        if not item.startswith("."):
+            item = f".{item}"
+        rules.extensions.add(item.lower())
+    elif key == "names":
+        rules.names.add(item)
+
+
+def parse_config_yaml(file_path: Path) -> PartialConfig:
+    if not file_path.exists() or not file_path.is_file():
+        return PartialConfig()
+
+    parsed = PartialConfig()
+    current_key: Optional[str] = None
+    list_keys = {"paths", "types", "extensions", "names"}
+    scalar_keys = {
+        "ignore_hidden",
+        "ignore_empty",
+        "scan_timeout",
+        "scan_timout",
+        "styling",
+        "auto_update",
+        "auto_copy",
+    }
+
+    try:
+        lines = file_path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return PartialConfig()
+
+    for raw in lines:
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+
+        stripped = line.strip()
+        if stripped in {"}", "]"}:
+            current_key = None
+            continue
+
+        if ":" in stripped and not stripped.startswith("-"):
+            key, rest = stripped.split(":", 1)
+            key = key.strip()
+            rest = rest.strip()
+
+            if key in list_keys:
+                current_key = key
+                if rest and rest not in {"{", "[", "{}", "[]"}:
+                    for item in split_csv_args([rest]):
+                        add_ignore_item(parsed.ignore_rules, key, item)
+                continue
+
+            current_key = None
+            if key not in scalar_keys:
+                continue
+
+            if key in {"ignore_hidden", "ignore_empty", "styling", "auto_update", "auto_copy"}:
+                bool_value = parse_bool_token(rest)
+                if bool_value is None:
+                    continue
+                if key == "ignore_hidden":
+                    parsed.ignore_hidden = bool_value
+                elif key == "ignore_empty":
+                    parsed.ignore_empty = bool_value
+                elif key == "styling":
+                    parsed.styling = bool_value
+                elif key == "auto_update":
+                    parsed.auto_update = bool_value
+                elif key == "auto_copy":
+                    parsed.auto_copy = bool_value
+                continue
+
+            timeout_value = parse_int_token(rest)
+            if timeout_value is not None:
+                parsed.scan_timeout = max(0, timeout_value)
+            continue
+
+        if stripped.startswith("-") and current_key in list_keys:
+            item = stripped[1:].strip()
+            if item:
+                add_ignore_item(parsed.ignore_rules, current_key, item)
+
+    return parsed
+
+
+def merge_partial_config(base: PartialConfig, override: PartialConfig) -> PartialConfig:
+    return PartialConfig(
+        ignore_rules=base.ignore_rules.merge(override.ignore_rules),
+        ignore_hidden=override.ignore_hidden if override.ignore_hidden is not None else base.ignore_hidden,
+        ignore_empty=override.ignore_empty if override.ignore_empty is not None else base.ignore_empty,
+        scan_timeout=override.scan_timeout if override.scan_timeout is not None else base.scan_timeout,
+        styling=override.styling if override.styling is not None else base.styling,
+        auto_update=override.auto_update if override.auto_update is not None else base.auto_update,
+        auto_copy=override.auto_copy if override.auto_copy is not None else base.auto_copy,
+    )
+
+
+def resolve_config_paths(root: Path) -> List[Path]:
+    paths = [Path.cwd() / DEFAULT_CONFIG_FILE_NAME]
+    root_config = root / DEFAULT_CONFIG_FILE_NAME
+    if root_config.resolve() != paths[0].resolve():
+        paths.append(root_config)
+    return paths
+
+
+def build_runtime_config(root: Path, args: argparse.Namespace) -> RuntimeConfig:
+    merged = PartialConfig()
+    found_config_file = False
+    for config_path in resolve_config_paths(root):
+        if config_path.exists() and config_path.is_file():
+            found_config_file = True
+        merged = merge_partial_config(merged, parse_config_yaml(config_path))
+
+    if not found_config_file:
+        merged.ignore_rules = default_common_ignore_rules().merge(merged.ignore_rules)
+
+    cli_rules = IgnoreRules(
+        paths={normalize_rel(p) for p in split_csv_args(args.paths)},
+        types={t.lower() for t in split_csv_args(args.types)},
+        extensions={e.lower() if e.startswith(".") else f".{e.lower()}" for e in split_csv_args(args.extensions)},
+        names=split_csv_args(args.names),
+    )
+
+    config_rules = merged.ignore_rules
+    ignore_enabled = args.ignore or has_ignore_rules(config_rules) or has_ignore_rules(cli_rules)
+    effective_rules = config_rules.merge(cli_rules) if ignore_enabled else IgnoreRules()
+
+    return RuntimeConfig(
+        ignore_rules=effective_rules,
+        ignore_hidden=True if merged.ignore_hidden is None else merged.ignore_hidden,
+        ignore_empty=False if merged.ignore_empty is None else merged.ignore_empty,
+        scan_timeout=DEFAULT_SCAN_TIMEOUT_SECONDS if merged.scan_timeout is None else max(0, merged.scan_timeout),
+        styling=True if merged.styling is None else merged.styling,
+        auto_update=True if merged.auto_update is None else merged.auto_update,
+        auto_copy=False if merged.auto_copy is None else merged.auto_copy,
+    )
+
+
+def set_config_auto_update(config_path: Path, enabled: bool) -> None:
+    bool_text = "true" if enabled else "false"
+    lines: List[str] = []
+    if config_path.exists() and config_path.is_file():
+        try:
+            lines = config_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            lines = []
+
+    replaced = False
+    new_lines: List[str] = []
+    for line in lines:
+        if re.match(r"^\s*auto_update\s*:", line):
+            new_lines.append(f"auto_update: {bool_text}")
+            replaced = True
+        else:
+            new_lines.append(line)
+
+    if not replaced:
+        if new_lines and new_lines[-1].strip():
+            new_lines.append("")
+        new_lines.append(f"auto_update: {bool_text}")
+
+    content = "\n".join(new_lines).rstrip() + "\n"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(content, encoding="utf-8")
+
+
+def version_tuple(version: str) -> Optional[Tuple[int, int, int]]:
+    cleaned = version.strip().lstrip("vV")
+    if not cleaned:
+        return None
+    tokens = cleaned.split(".")
+    numbers: List[int] = []
+    for token in tokens:
+        match = re.match(r"^(\d+)", token)
+        if not match:
+            return None
+        numbers.append(int(match.group(1)))
+    while len(numbers) < 3:
+        numbers.append(0)
+    return (numbers[0], numbers[1], numbers[2])
+
+
+def compare_versions(left: str, right: str) -> int:
+    left_tuple = version_tuple(left)
+    right_tuple = version_tuple(right)
+    if left_tuple is not None and right_tuple is not None:
+        if left_tuple > right_tuple:
+            return 1
+        if left_tuple < right_tuple:
+            return -1
+        return 0
+
+    if left == right:
+        return 0
+    return 1 if left > right else -1
+
+
+def fetch_remote_extract() -> str:
+    request = urllib.request.Request(
+        REMOTE_EXTRACT_URL,
+        headers={"User-Agent": f"omni-extract/{VERSION}", "Accept": "text/plain"},
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=DEFAULT_HTTP_TIMEOUT_SECONDS) as response:
+        body = response.read().decode("utf-8")
+        return body
+
+
+def extract_remote_version(script: str) -> Optional[str]:
+    match = re.search(r'^VERSION\s*=\s*["\']([^"\']+)["\']\s*$', script, flags=re.MULTILINE)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def validate_remote_script(script: str) -> bool:
+    return script.startswith("#!/usr/bin/env python3") and "def main(" in script
+
+
+def apply_update_script(executable_path: Path, new_script: str) -> None:
+    executable_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(prefix=f".{executable_path.name}.", suffix=".tmp", dir=str(executable_path.parent))
+    tmp_path = Path(tmp_name)
+    backup_path = executable_path.with_name(f".{executable_path.name}.bak")
+    old_mode = 0o755
+    if executable_path.exists():
+        old_mode = executable_path.stat().st_mode & 0o777
+        shutil.copy2(executable_path, backup_path)
+
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+            handle.write(new_script)
+        os.chmod(tmp_path, old_mode | 0o111)
+        os.replace(tmp_path, executable_path)
+        backup_path.unlink(missing_ok=True)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if backup_path.exists():
+            shutil.copy2(backup_path, executable_path)
+            backup_path.unlink(missing_ok=True)
+        raise
+
+
+def check_for_updates() -> Tuple[bool, Optional[str], Optional[str]]:
+    script = fetch_remote_extract()
+    if not validate_remote_script(script):
+        raise RuntimeError("downloaded script validation failed")
+    remote_version = extract_remote_version(script)
+    if not remote_version:
+        raise RuntimeError("remote version metadata missing")
+    has_update = compare_versions(remote_version, VERSION) > 0
+    return (has_update, remote_version, script)
+
+
+def run_self_update(executable_path: Path, silent: bool = False) -> Tuple[int, bool, Optional[str]]:
+    try:
+        has_update, remote_version, script = check_for_updates()
+    except (RuntimeError, urllib.error.URLError, TimeoutError, OSError) as exc:
+        if not silent:
+            print(f"update check failed: {exc}", file=sys.stderr)
+        return (1, False, None)
+
+    if not has_update or remote_version is None or script is None:
+        if not silent:
+            print(f"extract is already up to date ({VERSION})")
+        return (0, False, remote_version)
+
+    try:
+        apply_update_script(executable_path, script)
+    except OSError as exc:
+        if not silent:
+            print(f"update failed: {exc}", file=sys.stderr)
+        return (1, False, remote_version)
+
+    if not silent:
+        print(f"extract updated: {VERSION} -> {remote_version}")
+    return (0, True, remote_version)
+
+
+def update_status() -> Tuple[str, bool]:
+    try:
+        has_update, remote_version, _script = check_for_updates()
+    except (RuntimeError, urllib.error.URLError, TimeoutError, OSError) as exc:
+        return (f"update check failed: {exc}", False)
+
+    if has_update and remote_version is not None:
+        return (f"update available: {VERSION} -> {remote_version}", True)
+    return (f"extract is up to date ({VERSION})", False)
+
+
+def maybe_auto_update(executable_path: Path, allow_auto_update: bool, config_auto_update: bool) -> None:
+    if not allow_auto_update:
+        return
+    if os.environ.get("OMNI_EXTRACT_NO_AUTO_UPDATE") == "1":
+        return
+    if not config_auto_update:
+        return
+
+    state = read_json_file(STATE_FILE)
+    last_check_raw = state.get("last_auto_update_check")
+    last_check = 0.0
+    if isinstance(last_check_raw, (int, float, str)):
+        try:
+            last_check = float(last_check_raw)
+        except ValueError:
+            last_check = 0.0
+
+    now = time.time()
+    if now - last_check < AUTO_UPDATE_INTERVAL_SECONDS:
+        return
+
+    state["last_auto_update_check"] = now
+    try:
+        write_json_file(STATE_FILE, state)
+    except OSError:
+        pass
+
+    result, updated, remote_version = run_self_update(executable_path, silent=True)
+    if result == 0 and updated and remote_version:
+        print(f"extract auto-updated to {remote_version}; rerun to use new version", file=sys.stderr)
+
+
+def split_csv_args(values: List[str]) -> Set[str]:
+    out: Set[str] = set()
+    for value in values:
+        for part in value.split(","):
+            cleaned = part.strip().strip("{}[]")
+            if cleaned:
+                out.add(cleaned)
+    return out
+
+
+def normalize_rel(path: str) -> str:
+    normed = path.replace("\\", "/").strip()
+    if normed.startswith("./"):
+        normed = normed[2:]
+    return normed.rstrip("/")
+
+
+def relative_age(ts: float) -> str:
+    delta = max(0, int(time.time() - ts))
+    units = [
+        (60, "s"),
+        (60, "m"),
+        (24, "h"),
+        (7, "d"),
+        (4, "w"),
+        (12, "mo"),
+    ]
+    value = delta
+    suffix = "s"
+    for base, unit in units:
+        if value < base:
+            suffix = unit
+            break
+        value //= base
+        suffix = unit
+    else:
+        suffix = "y"
+    return f"{value}{suffix} ago"
+
+
+def modified_clock_time(ts: float) -> str:
+    text = datetime.fromtimestamp(ts).strftime("%I:%M%p")
+    return text.lstrip("0").lower()
+
+
+def terminal_width() -> int:
+    env_columns = os.environ.get("COLUMNS")
+    if env_columns is not None:
+        try:
+            parsed = int(env_columns)
+            if parsed > 0:
+                return parsed
+        except ValueError:
+            pass
+
+    try:
+        return shutil.get_terminal_size(fallback=(120, 24)).columns
+    except OSError:
+        return 120
+
+
+def use_color_output(styling: bool) -> bool:
+    if not styling:
+        return False
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    force = os.environ.get("FORCE_COLOR")
+    if force and force != "0":
+        return True
+    if os.environ.get("TERM") == "dumb":
+        return False
+    return sys.stdout.isatty()
+
+
+def colorize(text: str, color_code: str, enabled: bool) -> str:
+    if not enabled or not color_code:
+        return text
+    return f"{color_code}{text}{CLR_RESET}"
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", text)
+
+
+def char_display_width(char: str) -> int:
+    if char == "\u200d":
+        return 0
+    if "\ufe00" <= char <= "\ufe0f":
+        return 0
+
+    if _wcwidth is not None:
+        width = _wcwidth(char)
+        return width if width > 0 else 0
+
+    if unicodedata.combining(char):
+        return 0
+
+    category = unicodedata.category(char)
+    if category.startswith("C"):
+        return 0
+
+    codepoint = ord(char)
+    if 0x1F300 <= codepoint <= 0x1FAFF or 0x2600 <= codepoint <= 0x27BF:
+        return 2
+    if unicodedata.east_asian_width(char) in {"F", "W"}:
+        return 2
+
+    return 1
+
+
+def display_width(text: str) -> int:
+    clean = strip_ansi(text)
+    return sum(char_display_width(ch) for ch in clean)
+
+
+def truncate_left_display(text: str, max_width: int) -> str:
+    clean = strip_ansi(text)
+    if max_width <= 0:
+        return ""
+
+    out: List[str] = []
+    width = 0
+    for char in clean:
+        char_width = char_display_width(char)
+        if width + char_width > max_width:
+            break
+        out.append(char)
+        width += char_width
+    return "".join(out)
+
+
+def truncate_right_display(text: str, max_width: int) -> str:
+    clean = strip_ansi(text)
+    if max_width <= 0:
+        return ""
+
+    out: List[str] = []
+    width = 0
+    for char in reversed(clean):
+        char_width = char_display_width(char)
+        if width + char_width > max_width:
+            break
+        out.append(char)
+        width += char_width
+
+    out.reverse()
+    return "".join(out)
+
+
+def fit_cell(value: str, width: int, align: str = "left") -> str:
+    if width <= 0:
+        return ""
+
+    text = strip_ansi(str(value))
+    text_width = display_width(text)
+
+    if text_width > width:
+        if width <= 3:
+            text = truncate_left_display(text, width) if align != "right" else truncate_right_display(text, width)
+        elif align == "right":
+            text = "..." + truncate_right_display(text, width - 3)
+        else:
+            text = truncate_left_display(text, width - 3) + "..."
+
+    pad = max(0, width - display_width(text))
+
+    if align == "right":
+        return (" " * pad) + text
+    if align == "center":
+        left_pad = pad // 2
+        right_pad = pad - left_pad
+        return (" " * left_pad) + text + (" " * right_pad)
+    return text + (" " * pad)
+
+
+def compose_left_right(left: str, right: str, width: int) -> str:
+    if width <= 0:
+        return ""
+
+    left_clean = strip_ansi(left)
+    right_clean = strip_ansi(right)
+    left_width = display_width(left_clean)
+    right_width = display_width(right_clean)
+
+    if left_width + right_width <= width:
+        gap = width - left_width - right_width
+        return left_clean + (" " * gap) + right_clean
+
+    if right_width >= width:
+        return fit_cell(right_clean, width, "right")
+
+    left_max = max(0, width - right_width - 1)
+    left_fitted = fit_cell(left_clean, left_max)
+    return left_fitted + " " + right_clean
+
+
+def compose_left_center_right(left: str, center: str, right: str, width: int) -> str:
+    if width <= 0:
+        return ""
+
+    left_clean = strip_ansi(left)
+    center_clean = strip_ansi(center)
+    right_clean = strip_ansi(right)
+
+    right_clean = truncate_right_display(right_clean, width)
+    right_width = display_width(right_clean)
+
+    left_limit = max(0, width - right_width - 1)
+    left_clean = truncate_left_display(left_clean, left_limit)
+    left_width = display_width(left_clean)
+
+    center_limit = max(0, width - left_width - right_width - 2)
+    center_clean = truncate_left_display(center_clean, center_limit)
+    center_width = display_width(center_clean)
+
+    if center_width <= 0:
+        return compose_left_right(left_clean, right_clean, width)
+
+    right_start = width - right_width
+    center_start = (width - center_width) // 2
+    min_center_start = left_width + 1
+    max_center_start = right_start - center_width - 1
+
+    if max_center_start < min_center_start:
+        return compose_left_right(f"{left_clean} {center_clean}".strip(), right_clean, width)
+
+    if center_start < min_center_start:
+        center_start = min_center_start
+    if center_start > max_center_start:
+        center_start = max_center_start
+
+    gap_left = center_start - left_width
+    gap_right = right_start - (center_start + center_width)
+
+    return left_clean + (" " * gap_left) + center_clean + (" " * gap_right) + right_clean
+
+
+def split_tree_walls(label: str) -> Tuple[str, str]:
+    wall_chars = {"│", " ", "├", "└", "─", "`", "|"}
+    idx = 0
+    while idx < len(label) and label[idx] in wall_chars:
+        idx += 1
+    return (label[:idx], label[idx:])
+
+
+def column_layout(total_width: int) -> Tuple[int, int, int, int, str]:
+    separator = "   " if total_width >= 60 else " "
+    col1, col2, col3 = 10, 9, 9
+    min_col1, min_col2, min_col3 = 4, 4, 6
+
+    def metadata_width() -> int:
+        return col1 + col2 + col3 + (2 * len(separator))
+
+    while total_width - metadata_width() < 16 and (col1 > min_col1 or col2 > min_col2 or col3 > min_col3):
+        if col1 > min_col1:
+            col1 -= 1
+        elif col2 > min_col2:
+            col2 -= 1
+        elif col3 > min_col3:
+            col3 -= 1
+
+    while total_width - metadata_width() < 1 and (col1 > 1 or col2 > 1 or col3 > 1):
+        if col1 > 1:
+            col1 -= 1
+        elif col2 > 1:
+            col2 -= 1
+        elif col3 > 1:
+            col3 -= 1
+
+    label_width = max(1, total_width - metadata_width())
+    return (label_width, col1, col2, col3, separator)
+
+
+def human_size(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    units = ["KB", "MB", "GB", "TB"]
+    value = float(size)
+    unit = "B"
+    for unit in units:
+        value /= 1024.0
+        if value < 1024:
+            return f"{value:.1f} {unit}"
+    return f"{value:.1f} PB"
+
+
+def count_lines(file_path: Path) -> int:
+    try:
+        with file_path.open("rb") as handle:
+            count = 0
+            chunk = handle.read(1024 * 1024)
+            saw_data = False
+            last_byte = None
+            while chunk:
+                saw_data = True
+                count += chunk.count(b"\n")
+                last_byte = chunk[-1]
+                chunk = handle.read(1024 * 1024)
+            if saw_data and last_byte != 10:
+                count += 1
+            return count
+    except Exception:
+        return 0
+
+
+def detect_kind(path: Path) -> str:
+    if path.is_symlink():
+        return "link"
+    if path.is_dir():
+        return "dir"
+    return "file"
+
+
+def should_ignore(rel_path: str, name: str, kind: str, extension: str, rules: IgnoreRules) -> bool:
+    if kind in rules.types:
+        return True
+    if name in rules.names:
+        return True
+    if extension and extension.lower() in rules.extensions:
+        return True
+
+    rel_norm = normalize_rel(rel_path)
+    for ignored in rules.paths:
+        if not ignored:
+            continue
+        if rel_norm == ignored or rel_norm.startswith(f"{ignored}/"):
+            return True
+    return False
+
+
+def git_markers(root: Path) -> Dict[str, str]:
+    markers: Dict[str, str] = {}
+    try:
+        probe = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        if probe.returncode != 0:
+            return markers
+
+        result = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return markers
+
+        for line in result.stdout.splitlines():
+            if len(line) < 4:
+                continue
+            status = line[:2]
+            path_part = line[3:]
+            if " -> " in path_part:
+                path_part = path_part.split(" -> ", 1)[1]
+            marker = ""
+            if status == "??":
+                marker = "?"
+            elif "A" in status:
+                marker = "A"
+            elif "M" in status:
+                marker = "M"
+            elif "D" in status:
+                marker = "D"
+            if marker:
+                markers[normalize_rel(path_part)] = marker
+    except Exception:
+        return {}
+    return markers
+
+
+def scan_tree(
+    path: Path,
+    root: Path,
+    config: RuntimeConfig,
+    stats: ScanStats,
+    deadline: Optional[float],
+) -> Optional[Node]:
+    if deadline is not None and time.perf_counter() >= deadline:
+        stats.timed_out = True
+        return None
+
+    kind = detect_kind(path)
+    rel_path = normalize_rel(str(path.relative_to(root))) if path != root else ""
+    name = path.name
+    extension = path.suffix.lower()
+
+    if path != root and config.ignore_hidden and name.startswith("."):
+        stats.hidden += 1
+        return None
+
+    if path != root and should_ignore(rel_path, name, kind, extension, config.ignore_rules):
+        return None
+
+    try:
+        st = path.lstat() if kind == "link" else path.stat()
+    except OSError:
+        return None
+
+    if kind == "link":
+        stats.links += 1
+        return Node(path=path, rel_path=rel_path, kind=kind, size=0, mtime=st.st_mtime)
+
+    if kind == "file":
+        size = st.st_size
+        if config.ignore_empty and size == 0:
+            return None
+
+        line_count = count_lines(path)
+        stats.files += 1
+        stats.lines += line_count
+        stats.size += size
+
+        ext = path.suffix.lower().lstrip(".") or "(none)"
+        stats.type_counts[ext] = stats.type_counts.get(ext, 0) + 1
+
+        rel_display = rel_path or path.name
+        if stats.largest is None or size > stats.largest[1]:
+            stats.largest = (rel_display, size)
+        if stats.newest is None or st.st_mtime > stats.newest[1]:
+            stats.newest = (rel_display, st.st_mtime)
+
+        return Node(path=path, rel_path=rel_path, kind=kind, size=size, mtime=st.st_mtime, lines=line_count)
+
+    stats.dirs += 1 if path != root else 0
+    node = Node(path=path, rel_path=rel_path, kind="dir", size=0, mtime=st.st_mtime)
+
+    try:
+        entries = list(path.iterdir())
+    except OSError:
+        return node
+
+    children: List[Node] = []
+    for child in entries:
+        if deadline is not None and time.perf_counter() >= deadline:
+            stats.timed_out = True
+            break
+        scanned = scan_tree(child, root, config, stats, deadline)
+        if scanned is not None:
+            children.append(scanned)
+
+    children.sort(key=lambda n: (0 if n.kind == "dir" else 1 if n.kind == "file" else 2, n.basename.lower()))
+    node.children = children
+
+    total_size = 0
+    newest = node.mtime
+    for child in children:
+        total_size += child.size
+        if child.mtime > newest:
+            newest = child.mtime
+    node.size = total_size
+    node.mtime = newest
+
+    if path != root and config.ignore_empty and not node.children:
+        return None
+
+    return node
+
+
+def dir_file_count(node: Node) -> int:
+    count = 0
+    for child in node.children:
+        if child.kind == "file":
+            count += 1
+        elif child.kind == "dir":
+            count += dir_file_count(child)
+    return count
+
+
+def collect_lines(
+    node: Node,
+    prefix: str,
+    markers: Dict[str, str],
+    rows: List[Tuple[str, str, str, str]],
+    is_last: bool,
+    styling: bool,
+) -> None:
+    if styling:
+        connector = "└── " if is_last else "├── "
+        child_indent = "    " if is_last else "│   "
+        dir_prefix = "📁 "
+        file_prefix = "📄 "
+        link_prefix = "🔗 "
+    else:
+        connector = "`-- " if is_last else "|-- "
+        child_indent = "    " if is_last else "|   "
+        dir_prefix = ""
+        file_prefix = ""
+        link_prefix = ""
+
+    line_prefix = prefix + connector
+
+    if node.kind == "dir":
+        label = f"{line_prefix}{dir_prefix}{node.basename}/"
+        col1 = f"{dir_file_count(node)} files"
+        col2 = human_size(node.size)
+        col3 = relative_age(node.mtime)
+    elif node.kind == "file":
+        marker = markers.get(node.rel_path, "")
+        marker_text = f" [{marker}]" if marker else ""
+        label = f"{line_prefix}{file_prefix}{node.basename}{marker_text}"
+        col1 = f"{node.lines}L"
+        col2 = human_size(node.size)
+        col3 = relative_age(node.mtime)
+    else:
+        try:
+            target = os.readlink(node.path)
+            target_text = f" -> {target}"
+        except OSError:
+            target_text = ""
+        label = f"{line_prefix}{link_prefix}{node.basename}{target_text}"
+        col1 = ""
+        col2 = "link"
+        col3 = relative_age(node.mtime)
+
+    rows.append((label, col1, col2, col3))
+
+    if node.kind == "dir":
+        child_prefix = prefix + child_indent
+        for idx, child in enumerate(node.children):
+            collect_lines(child, child_prefix, markers, rows, idx == len(node.children) - 1, styling)
+
+
+def shorten_path(rel: str) -> str:
+    parts = rel.replace("\\", "/").split("/")
+    return parts[-1] if parts else rel
+
+
+def render_summary(
+    stats: ScanStats,
+    elapsed_ms: int,
+    styling: bool,
+    scan_timeout: int,
+    total_width: int,
+    use_color: bool,
+) -> str:
+    types_sorted = sorted(stats.type_counts.items(), key=lambda item: (-item[1], item[0]))
+    types_text = "   ".join([f"{name}: {count}" for name, count in types_sorted[:6]]) or "none"
+
+    largest_name = shorten_path(stats.largest[0]) if stats.largest else "n/a"
+    largest_size = human_size(stats.largest[1]) if stats.largest else "n/a"
+    newest_name = shorten_path(stats.newest[0]) if stats.newest else "n/a"
+    newest_age = relative_age(stats.newest[1]) if stats.newest else "n/a"
+    now_date = datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d")
+    now_clock = modified_clock_time(time.time())
+
+    if styling:
+        width = max(10, total_width)
+        left_divider_width = min(22, max(3, width // 3))
+        right_divider_width = max(1, width - left_divider_width - 3)
+        inner_width = max(0, width - 4)
+
+        def box_line(content: str, align: str = "left", content_color: str = "") -> str:
+            body = fit_cell(content, inner_width, align)
+            if content_color and use_color:
+                body = colorize(body, content_color, True)
+            return f"│ {body} │"
+
+        def metric_line(label: str, left_value: str, right_value: Optional[str] = None, content_color: str = "") -> str:
+            prefix = f"  {label:<18} |    "
+            available = max(0, inner_width - display_width(prefix))
+            if right_value is None:
+                body = fit_cell(left_value, available)
+            else:
+                body = compose_left_right(left_value, right_value, available)
+            return box_line(prefix + body, content_color=content_color)
+
+        totals_line = (
+            f"{stats.files} files   {stats.dirs} dirs   {stats.links} link   +{stats.hidden} hidden   "
+            f"{stats.lines:,} lines   {human_size(stats.size)}"
+        )
+
+        lines: List[str] = []
+        lines.append("┌" + "─" * max(0, width - 2) + "┐")
+        lines.append(box_line(totals_line, align="center", content_color=f"{CLR_BOLD}{CLR_CYAN}"))
+        lines.append("├" + "─" * left_divider_width + "┬" + "─" * right_divider_width + "┤")
+        lines.append(metric_line("largest", largest_name, largest_size, content_color=CLR_GREEN))
+        lines.append(metric_line("newest", newest_name, newest_age, content_color=CLR_BLUE))
+        lines.append(metric_line("types", types_text, content_color=CLR_MAGENTA))
+        lines.append("├" + "─" * left_divider_width + "┴" + "─" * right_divider_width + "┤")
+        lines.append(
+            box_line(
+                compose_left_center_right(f"⚡ scanned in {elapsed_ms}ms", now_date, now_clock, inner_width),
+                content_color=f"{CLR_BOLD}{CLR_MAGENTA}",
+            )
+        )
+        if stats.timed_out and scan_timeout > 0:
+            lines.append(box_line(f"⚠ scan timeout reached ({scan_timeout}s), results are partial", content_color=f"{CLR_BOLD}{CLR_RED}"))
+        lines.append("└" + "─" * max(0, width - 2) + "┘")
+        return "\n".join(lines)
+
+    lines = [
+        fit_cell(
+            f"{stats.files} files   {stats.dirs} dirs   {stats.links} link   +{stats.hidden} hidden   {stats.lines:,} lines   {human_size(stats.size)}",
+            max(1, total_width),
+            "center",
+        ),
+        f"largest: {largest_name} ({largest_size})",
+        f"newest: {newest_name} ({newest_age})",
+        f"types: {types_text}",
+        compose_left_center_right(f"scanned in {elapsed_ms}ms", now_date, now_clock, max(1, total_width)),
+    ]
+    if stats.timed_out and scan_timeout > 0:
+        lines.append(f"scan timeout reached ({scan_timeout}s), results are partial")
+    return "\n".join([fit_cell(line, max(1, total_width)) for line in lines])
+
+
+def render_tree(root: Node, markers: Dict[str, str], stats: ScanStats, elapsed_ms: int, config: RuntimeConfig) -> str:
+    total_width = terminal_width()
+    label_width, col1_width, col2_width, col3_width, separator = column_layout(total_width)
+    color_output = use_color_output(config.styling)
+
+    def row_label_color(label: str) -> str:
+        if "📁 " in label or label.rstrip().endswith("/"):
+            return f"{CLR_BOLD}{CLR_BLUE}"
+        if "🔗 " in label or " -> " in label:
+            return f"{CLR_BOLD}{CLR_CYAN}"
+        return CLR_CYAN
+
+    rows: List[Tuple[str, str, str, str]] = []
+    for idx, child in enumerate(root.children):
+        collect_lines(child, "", markers, rows, idx == len(root.children) - 1, config.styling)
+
+    root_label = f"📁 {root.path.name}/" if config.styling else f"{root.path.name}/"
+    header_label = fit_cell(root_label, label_width)
+    header_files = fit_cell("files", col1_width, "right")
+    header_size = fit_cell("size", col2_width, "right")
+    header_modified = fit_cell("modified", col3_width, "right")
+
+    if color_output:
+        header_label = colorize(header_label, f"{CLR_BOLD}{CLR_BLUE}", True)
+        header_files = colorize(header_files, f"{CLR_BOLD}{CLR_CYAN}", True)
+        header_size = colorize(header_size, f"{CLR_BOLD}{CLR_GREEN}", True)
+        header_modified = colorize(header_modified, f"{CLR_BOLD}{CLR_BLUE}", True)
+
+    output_lines = [
+        header_label
+        + header_files
+        + separator
+        + header_size
+        + separator
+        + header_modified
+    ]
+    for label, col1, col2, col3 in rows:
+        label_cell = fit_cell(label, label_width)
+        col1_cell = fit_cell(col1, col1_width, "right")
+        col2_cell = fit_cell(col2, col2_width, "right")
+        col3_cell = fit_cell(col3, col3_width, "right")
+
+        if color_output:
+            walls, content = split_tree_walls(label_cell)
+            label_cell = walls + colorize(content, row_label_color(label), True)
+            col1_cell = colorize(col1_cell, CLR_CYAN, True)
+            col2_cell = colorize(col2_cell, CLR_GREEN, True)
+            col3_cell = colorize(col3_cell, CLR_BLUE, True)
+
+        output_lines.append(
+            label_cell
+            + col1_cell
+            + separator
+            + col2_cell
+            + separator
+            + col3_cell
+        )
+
+    output_lines.append("")
+    output_lines.append(
+        render_summary(
+            stats,
+            elapsed_ms,
+            config.styling,
+            config.scan_timeout,
+            total_width,
+            color_output,
+        )
+    )
+    return "\n".join(output_lines)
+
+
+def copy_to_clipboard(content: str) -> Tuple[bool, Optional[str]]:
+    candidates = [
+        ["wl-copy"],
+        ["xclip", "-selection", "clipboard"],
+        ["xsel", "--clipboard", "--input"],
+        ["pbcopy"],
+        ["clip"],
+    ]
+
+    for command in candidates:
+        if shutil.which(command[0]) is None:
+            continue
+        try:
+            subprocess.run(command, input=content, text=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return (True, command[0])
+        except Exception:
+            continue
+    return (False, None)
+
+
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="extract", description="Extract a rich directory tree.")
+    parser.add_argument("path", nargs="?", default=".", help="Path to directory to extract")
+    parser.add_argument("--version", action="store_true", help="Show extract version")
+    parser.add_argument("--check-updates", action="store_true", help="Check if a new extract version is available")
+    parser.add_argument("--self-update", action="store_true", help="Download and install the latest extract")
+    parser.add_argument("--enable-auto-update", action="store_true", help="Enable auto-update in config.yaml")
+    parser.add_argument("--disable-auto-update", action="store_true", help="Disable auto-update in config.yaml")
+    parser.add_argument("--auto-update-status", action="store_true", help="Show effective auto-update state")
+    parser.add_argument("--no-auto-update", action="store_true", help="Skip auto-update check for this run")
+    parser.add_argument("--ignore", action="store_true", help="Enable ignore filters")
+    parser.add_argument("-f", "--paths", nargs="*", default=[], help="Ignore specific paths")
+    parser.add_argument("-t", "--types", nargs="*", default=[], help="Ignore types: file, dir, link")
+    parser.add_argument("-e", "--extensions", nargs="*", default=[], help="Ignore extensions")
+    parser.add_argument("-n", "--names", nargs="*", default=[], help="Ignore names")
+    return parser.parse_args(argv)
+
+
+def main(argv: List[str]) -> int:
+    args = parse_args(argv)
+    executable_path = current_executable_path()
+    provided_target = Path(args.path).expanduser()
+    if not provided_target.is_absolute():
+        provided_target = Path.cwd() / provided_target
+    target_is_valid_dir = provided_target.exists() and provided_target.is_dir()
+
+    config_target = provided_target.resolve() if target_is_valid_dir else Path.cwd().resolve()
+    config_path = config_target / DEFAULT_CONFIG_FILE_NAME
+
+    if args.version:
+        print(f"extract {VERSION}")
+        return 0
+
+    if args.enable_auto_update and args.disable_auto_update:
+        print("error: cannot enable and disable auto-update in one command", file=sys.stderr)
+        return 2
+
+    if (args.enable_auto_update or args.disable_auto_update or args.auto_update_status) and not target_is_valid_dir:
+        if args.path != ".":
+            print(f"error: '{provided_target}' is not a valid directory", file=sys.stderr)
+            return 1
+
+    if args.enable_auto_update:
+        set_config_auto_update(config_path, True)
+        print(f"auto-update enabled in {config_path}")
+        return 0
+
+    if args.disable_auto_update:
+        set_config_auto_update(config_path, False)
+        print(f"auto-update disabled in {config_path}")
+        return 0
+
+    if args.auto_update_status:
+        status_config = build_runtime_config(config_target, args)
+        status = "enabled" if status_config.auto_update else "disabled"
+        print(f"auto-update is {status} ({config_path})")
+        return 0
+
+    if args.check_updates:
+        message, _has_update = update_status()
+        if message.startswith("update check failed:"):
+            print(message, file=sys.stderr)
+            return 1
+        print(message)
+        return 0
+
+    if args.self_update:
+        result, _updated, _remote_version = run_self_update(executable_path, silent=False)
+        return result
+
+    target = Path(args.path).expanduser().resolve()
+
+    if not target.exists() or not target.is_dir():
+        print(f"error: '{target}' is not a valid directory", file=sys.stderr)
+        return 1
+
+    runtime_config = build_runtime_config(target, args)
+    maybe_auto_update(
+        executable_path,
+        allow_auto_update=not args.no_auto_update,
+        config_auto_update=runtime_config.auto_update,
+    )
+
+    start = time.perf_counter()
+    stats = ScanStats()
+    deadline = None
+    if runtime_config.scan_timeout > 0:
+        deadline = time.perf_counter() + float(runtime_config.scan_timeout)
+
+    tree = scan_tree(target, target, runtime_config, stats, deadline)
+    if tree is None:
+        if not stats.timed_out:
+            print("error: unable to scan target directory", file=sys.stderr)
+            return 1
+        try:
+            root_stat = target.stat()
+            root_mtime = root_stat.st_mtime
+        except OSError:
+            root_mtime = time.time()
+        tree = Node(path=target, rel_path="", kind="dir", size=0, mtime=root_mtime, children=[])
+
+    markers = git_markers(target)
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    output = render_tree(tree, markers, stats, elapsed_ms, runtime_config)
+    print(output)
+
+    if runtime_config.auto_copy:
+        copied, method = copy_to_clipboard(output)
+        if copied and method:
+            print(f"copied output to clipboard via {method}", file=sys.stderr)
+        else:
+            print("clipboard copy requested but no clipboard tool was found", file=sys.stderr)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
