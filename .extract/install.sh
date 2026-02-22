@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-PROJECT_REPO="omnious0o0/omni-extract"
-SOURCE_URL="${OMNI_EXTRACT_SOURCE_URL:-https://raw.githubusercontent.com/${PROJECT_REPO}/main/extract}"
+PROJECT_REPO="omnious0o0/extract"
+SOURCE_URL="${EXTRACT_SOURCE_URL:-https://raw.githubusercontent.com/${PROJECT_REPO}/main/extract}"
 
 DEFAULT_INSTALL_DIR="${HOME}/.local/bin"
 INSTALL_DIR=""
@@ -52,12 +52,12 @@ EOF
 
 logo() {
   cat <<'EOF'
- ██████╗ ███╗   ███╗███╗   ██╗██╗      ███████╗██╗  ██╗████████╗██████╗  █████╗  ██████╗████████╗
-██╔═══██╗████╗ ████║████╗  ██║██║      ██╔════╝╚██╗██╔╝╚══██╔══╝██╔══██╗██╔══██╗██╔════╝╚══██╔══╝
-██║   ██║██╔████╔██║██╔██╗ ██║██║█████╗█████╗   ╚███╔╝    ██║   ██████╔╝███████║██║        ██║   
-██║   ██║██║╚██╔╝██║██║╚██╗██║██║╚════╝██╔══╝   ██╔██╗    ██║   ██╔══██╗██╔══██║██║        ██║   
-╚██████╔╝██║ ╚═╝ ██║██║ ╚████║██║      ███████╗██╔╝ ██╗   ██║   ██║  ██║██║  ██║╚██████╗   ██║   
- ╚═════╝ ╚═╝     ╚═╝╚═╝  ╚═══╝╚═╝      ╚══════╝╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝   ╚═╝  
+ ███████╗██╗  ██╗████████╗██████╗  █████╗  ██████╗████████╗
+ ██╔════╝╚██╗██╔╝╚══██╔══╝██╔══██╗██╔══██╗██╔════╝╚══██╔══╝
+ █████╗   ╚███╔╝    ██║   ██████╔╝███████║██║        ██║   
+ ██╔══╝   ██╔██╗    ██║   ██╔══██╗██╔══██║██║        ██║   
+ ███████╗██╔╝ ██╗   ██║   ██║  ██║██║  ██║╚██████╗   ██║   
+ ╚══════╝╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝   ╚═╝   
 EOF
 }
 
@@ -209,7 +209,7 @@ validate_payload() {
 
 verify_executable() {
   local file_path="$1"
-  OMNI_EXTRACT_NO_AUTO_UPDATE=1 "${file_path}" --version >/dev/null 2>&1
+  EXTRACT_NO_AUTO_UPDATE=1 "${file_path}" --version >/dev/null 2>&1
 }
 
 ensure_global_access() {
@@ -313,7 +313,7 @@ if [[ "${QUIET}" != "1" ]]; then
   printf "%b" "${CLR_BLUE}"
   logo
   printf "%b" "${CLR_RESET}"
-  printf "%b%s%b\n" "${CLR_DIM}" "omni-extract installer" "${CLR_RESET}"
+  printf "%b%s%b\n" "${CLR_DIM}" "extract installer" "${CLR_RESET}"
 fi
 
 INSTALL_DIR="$(resolve_install_dir)"

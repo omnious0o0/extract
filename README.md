@@ -1,6 +1,6 @@
-# omni-extract
+# extract
 
-omni-extract is a tool to extract directory tree alongside important information for your agent like: size, last modified, type, etc.
+A fast directory scanner that gives you and your AI agent a clean, readable tree with the context that actually matters: size, line count, last modified, file type, and more.
 
 ## Example
 
@@ -33,52 +33,75 @@ omni-extract is a tool to extract directory tree alongside important information
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## installation
+**NOTE:** Don't worry, you can change the output styling and data amount to your liking in `config.yaml` to save tokens.
 
-**One-liner:**
+## Installation
+
 ```bash
-curl -sSL https://raw.githubusercontent.com/omnious0o0/omni-extract/main/.omni-extract/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/omnious0o0/extract/main/.extract/install.sh | bash
 ```
 
-## usage
+## Usage
 
-It's very easy to use, just run:
 ```bash
 extract <path/to/directory> # or . for current directory
 ```
 
-**Optionally, yet highly recommended, add:** 
+### Filtering
 ```bash
 --ignore -f path, path, ... -t type, type, ... -e extension, extension, ... -n name, name, ...
 # path: ignore specific files/folders by path
 # type: ignore specific types (file, dir, link)
-# extension: ignore specific extensions (EG. .git)
-# name: ignore specific names (EG. node_modules)
+# extension: ignore specific extensions (e.g. .git)
+# name: ignore specific names (e.g. node_modules)
+
+# Replace --ignore with --only to show only the specified files/folders
+```
+
+**Show everything** (including anything blocked by config):
+```bash
+--full
 ```
 
 ## config.yaml
-**You can always set them in `config.yaml` to make it persistent:**
-> Yaml structure:
+
+Stop retyping flags every time. Setting up `config.yaml` is highly recommended to tune `extract` to your exact workflow needs. It supports deep customization for styling, ignored paths, and rendering details:
+
 ```yaml
-paths: {
-    - path
-    ...
-}
-types: {...}
-extensions: {...}
-names: {...}
+paths:
+  - path
+types: []
+extensions: []
+names: []
+
+# File visibility controls
+ignore_hidden: true
+ignore_empty: false
 ```
 
-**Note:** On default hidden & common files and folders are ignored, you can edit the `config.yaml` file to change this, along with many other options.
+**Other settings:**
+```yaml
+styling: low          # full | low (recommended) | minimal (removes colors, NOT RECOMMENDED)
+emojis: false         # true | false (recommended)
+scan_data: full       # full (recommended) | medium | low | minimal
+
+scan_timeout: 60      # seconds
+auto_update: true
+auto_copy: false      # copy to clipboard after scan
+```
+
+> By default, hidden and common files/folders are ignored. Edit `config.yaml` to change this.
 
 ## Support
 
-If you liked omni-extract, please consider starring the repo, and dropping me a follow for more stuff like this :)  
-It takes less than a minute and will help a lot ❤️  
+If you liked extract, please consider starring the repo and dropping me a follow for more stuff like this :)
+It takes less than a minute and helps a lot ❤️
 
 If you want to show extra love, consider *[buying me a coffee](https://buymeacoffee.com/specter0o0)*! ☕
 
-[![alt text](https://imgs.search.brave.com/FolmlC7tneei1JY_QhD9teOLwsU3rivglA3z2wWgJL8/rs:fit:860:0:0:0/g:ce/aHR0cHM6Ly93aG9w/LmNvbS9ibG9nL2Nv/bnRlbnQvaW1hZ2Vz/L3NpemUvdzIwMDAv/MjAyNC8wNi9XaGF0/LWlzLUJ1eS1NZS1h/LUNvZmZlZS53ZWJw)](https://buymeacoffee.com/specter0o0)
+**RECOMMENDED:** Check out [commands-wrapper](https://github.com/omnious0o0/commands-wrapper) you and your agent will love it!
+
+[![Buy Me a Coffee](https://imgs.search.brave.com/FolmlC7tneei1JY_QhD9teOLwsU3rivglA3z2wWgJL8/rs:fit:860:0:0:0/g:ce/aHR0cHM6Ly93aG9w/LmNvbS9ibG9nL2Nv/bnRlbnQvaW1hZ2Vz/L3NpemUvdzIwMDAv/MjAyNC8wNi9XaGF0/LWlzLUJ1eS1NZS1h/LUNvZmZlZS53ZWJw)](https://buymeacoffee.com/specter0o0)
 
 ## License
 
