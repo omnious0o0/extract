@@ -1,10 +1,13 @@
+# Ignore exact relative paths (and everything under them)
 paths:
   - .git
   - .hg
   - .svn
 
+# Optional type-level ignore list: file, dir, link
 types: {}
 
+# Ignore by extension (include the leading dot)
 extensions:
   - .log
   - .tmp
@@ -24,6 +27,7 @@ extensions:
   - .dll
   - .exe
 
+# Ignore by basename (files or folders)
 names:
   - node_modules
   - bower_components
@@ -42,14 +46,8 @@ names:
   - .cache
   - .parcel-cache
   - .eslintcache
-  - coverage
-  - dist
-  - build
-  - out
-  - target
   - tmp
   - temp
-  - logs
   - __pycache__
   - .pytest_cache
   - .mypy_cache
@@ -59,16 +57,23 @@ names:
   - .venv
   - venv
   - env
-  - .idea
-  - .vscode
   - .DS_Store
   - Thumbs.db
 
+# File visibility controls
 ignore_hidden: true
 ignore_empty: false
 
-# other
+# Rendering controls
+# styling: full | low (recomended) | minimal (removes colors, NOT RECOMENDED)
+styling: low
+# show emojis: true | false (recomended)
+emojis: false
+# how much data to show: full (recomended) | medium | low | minimal
+scan_data: full
+
+# Runtime controls
 scan_timeout: 60 # seconds
-styling: true # better looking output for clarity. You can turn it off to save tokens if only your agent uses it.
 auto_update: true
 auto_copy: false # copy to clipboard after scan
+

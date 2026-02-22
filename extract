@@ -26,7 +26,6 @@ try:
 except Exception:
     _wcwidth = None
 
-
 VERSION = "1.0.0"
 PROJECT_REPO = "omnious0o0/omni-extract"
 REMOTE_EXTRACT_URL = os.environ.get(
@@ -37,6 +36,8 @@ AUTO_UPDATE_INTERVAL_SECONDS = 24 * 60 * 60
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10
 DEFAULT_SCAN_TIMEOUT_SECONDS = 60
 DEFAULT_CONFIG_FILE_NAME = "config.yaml"
+GLOBAL_CONFIG_DIR = Path.home() / ".config" / "omni-extract"
+GLOBAL_CONFIG_FILE = GLOBAL_CONFIG_DIR / DEFAULT_CONFIG_FILE_NAME
 STATE_FILE = Path.home() / ".cache" / "omni-extract" / "state.json"
 ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 CLR_RESET = "\033[0m"
@@ -48,6 +49,8 @@ CLR_YELLOW = "\033[33m"
 CLR_BLUE = "\033[34m"
 CLR_MAGENTA = "\033[35m"
 CLR_CYAN = "\033[36m"
+VALID_STYLING_MODES = {"full", "low", "minimal"}
+VALID_SCAN_DATA_LEVELS = {"full", "medium", "low", "minimal"}
 
 
 @dataclass
@@ -102,6 +105,10 @@ class PartialConfig:
     ignore_empty: Optional[bool] = None
     scan_timeout: Optional[int] = None
     styling: Optional[bool] = None
+    styling_mode: Optional[str] = None
+    scan_emojis: Optional[bool] = None
+    scan_data: Optional[str] = None
+    scan_structure: Optional[str] = None
     auto_update: Optional[bool] = None
     auto_copy: Optional[bool] = None
 
@@ -109,12 +116,17 @@ class PartialConfig:
 @dataclass
 class RuntimeConfig:
     ignore_rules: IgnoreRules = field(default_factory=IgnoreRules)
+    only_rules: IgnoreRules = field(default_factory=IgnoreRules)
     ignore_hidden: bool = True
     ignore_empty: bool = False
     scan_timeout: int = DEFAULT_SCAN_TIMEOUT_SECONDS
-    styling: bool = True
+    styling_mode: str = "low"
+    scan_emojis: bool = False
+    scan_data: str = "full"
+    scan_structure: str = "dynamic"
     auto_update: bool = True
     auto_copy: bool = False
+    only_mode: bool = False
 
 
 def current_executable_path() -> Path:
@@ -173,6 +185,48 @@ def parse_int_token(value: str) -> Optional[int]:
         return None
 
 
+def normalize_choice_token(value: str) -> str:
+    return value.strip().strip('"\'').lower()
+
+
+def normalize_styling_mode(value: str) -> Optional[str]:
+    normalized = normalize_choice_token(value)
+    if normalized in VALID_STYLING_MODES:
+        return normalized
+    return None
+
+
+def normalize_scan_data_level(value: str) -> Optional[str]:
+    normalized = normalize_choice_token(value)
+    if normalized in VALID_SCAN_DATA_LEVELS:
+        return normalized
+    return None
+
+
+def parse_optional_bool_token(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    return parse_bool_token(value)
+
+
+def has_tree_structure(styling_mode: str) -> bool:
+    return styling_mode in {"full", "low"}
+
+
+def has_summary_box(styling_mode: str) -> bool:
+    return styling_mode == "full"
+
+
+def data_columns_enabled(scan_data: str) -> Tuple[bool, bool, bool]:
+    if scan_data == "full":
+        return (True, True, True)
+    if scan_data == "medium":
+        return (False, True, True)
+    if scan_data == "low":
+        return (False, False, True)
+    return (False, False, False)
+
+
 def has_ignore_rules(rules: IgnoreRules) -> bool:
     return bool(rules.paths or rules.types or rules.extensions or rules.names)
 
@@ -217,14 +271,8 @@ def default_common_ignore_rules() -> IgnoreRules:
             ".cache",
             ".parcel-cache",
             ".eslintcache",
-            "coverage",
-            "dist",
-            "build",
-            "out",
-            "target",
             "tmp",
             "temp",
-            "logs",
             "__pycache__",
             ".pytest_cache",
             ".mypy_cache",
@@ -234,8 +282,6 @@ def default_common_ignore_rules() -> IgnoreRules:
             ".venv",
             "venv",
             "env",
-            ".idea",
-            ".vscode",
             ".DS_Store",
             "Thumbs.db",
         },
@@ -272,9 +318,19 @@ def parse_config_yaml(file_path: Path) -> PartialConfig:
         "scan_timeout",
         "scan_timout",
         "styling",
+        "styling_mode",
+        "scan_emojis",
+        "scan_data",
+        "scan_structure",
         "auto_update",
         "auto_copy",
     }
+    key_aliases = {
+        "style": "styling",
+        "emojis": "scan_emojis",
+        "data": "scan_data",
+    }
+    scalar_keys = scalar_keys | set(key_aliases.keys())
 
     try:
         lines = file_path.read_text(encoding="utf-8").splitlines()
@@ -295,6 +351,7 @@ def parse_config_yaml(file_path: Path) -> PartialConfig:
             key, rest = stripped.split(":", 1)
             key = key.strip()
             rest = rest.strip()
+            canonical_key = key_aliases.get(key, key)
 
             if key in list_keys:
                 current_key = key
@@ -307,26 +364,50 @@ def parse_config_yaml(file_path: Path) -> PartialConfig:
             if key not in scalar_keys:
                 continue
 
-            if key in {"ignore_hidden", "ignore_empty", "styling", "auto_update", "auto_copy"}:
+            if canonical_key in {"ignore_hidden", "ignore_empty", "scan_emojis", "auto_update", "auto_copy"}:
                 bool_value = parse_bool_token(rest)
                 if bool_value is None:
                     continue
-                if key == "ignore_hidden":
+                if canonical_key == "ignore_hidden":
                     parsed.ignore_hidden = bool_value
-                elif key == "ignore_empty":
+                elif canonical_key == "ignore_empty":
                     parsed.ignore_empty = bool_value
-                elif key == "styling":
-                    parsed.styling = bool_value
-                elif key == "auto_update":
+                elif canonical_key == "scan_emojis":
+                    parsed.scan_emojis = bool_value
+                elif canonical_key == "auto_update":
                     parsed.auto_update = bool_value
-                elif key == "auto_copy":
+                elif canonical_key == "auto_copy":
                     parsed.auto_copy = bool_value
+                continue
+
+            if canonical_key in {"styling", "styling_mode"}:
+                bool_value = parse_bool_token(rest)
+                if bool_value is not None:
+                    parsed.styling = bool_value
+                    parsed.styling_mode = None
+                    continue
+                styling_mode = normalize_styling_mode(rest)
+                if styling_mode is not None:
+                    parsed.styling_mode = styling_mode
+                    parsed.styling = None
+                continue
+
+            if canonical_key == "scan_data":
+                scan_data = normalize_scan_data_level(rest)
+                if scan_data is not None:
+                    parsed.scan_data = scan_data
+                continue
+
+            if canonical_key == "scan_structure":
+                scan_structure = normalize_choice_token(rest)
+                if scan_structure in {"dynamic", "static"}:
+                    parsed.scan_structure = scan_structure
                 continue
 
             timeout_value = parse_int_token(rest)
             if timeout_value is not None:
                 parsed.scan_timeout = max(0, timeout_value)
-            continue
+                continue
 
         if stripped.startswith("-") and current_key in list_keys:
             item = stripped[1:].strip()
@@ -337,32 +418,56 @@ def parse_config_yaml(file_path: Path) -> PartialConfig:
 
 
 def merge_partial_config(base: PartialConfig, override: PartialConfig) -> PartialConfig:
+    if override.styling_mode is not None:
+        merged_styling_mode = override.styling_mode
+    elif override.styling is not None:
+        merged_styling_mode = None
+    else:
+        merged_styling_mode = base.styling_mode
+
     return PartialConfig(
         ignore_rules=base.ignore_rules.merge(override.ignore_rules),
         ignore_hidden=override.ignore_hidden if override.ignore_hidden is not None else base.ignore_hidden,
         ignore_empty=override.ignore_empty if override.ignore_empty is not None else base.ignore_empty,
         scan_timeout=override.scan_timeout if override.scan_timeout is not None else base.scan_timeout,
         styling=override.styling if override.styling is not None else base.styling,
+        styling_mode=merged_styling_mode,
+        scan_emojis=override.scan_emojis if override.scan_emojis is not None else base.scan_emojis,
+        scan_data=override.scan_data if override.scan_data is not None else base.scan_data,
+        scan_structure=override.scan_structure if override.scan_structure is not None else base.scan_structure,
         auto_update=override.auto_update if override.auto_update is not None else base.auto_update,
         auto_copy=override.auto_copy if override.auto_copy is not None else base.auto_copy,
     )
 
 
-def resolve_config_paths(root: Path) -> List[Path]:
-    paths = [Path.cwd() / DEFAULT_CONFIG_FILE_NAME]
-    root_config = root / DEFAULT_CONFIG_FILE_NAME
-    if root_config.resolve() != paths[0].resolve():
-        paths.append(root_config)
-    return paths
+def resolve_config_path(root: Path, args: argparse.Namespace) -> Optional[Path]:
+    explicit_raw = getattr(args, "config_file", None)
+    if explicit_raw:
+        explicit_path = Path(explicit_raw).expanduser()
+        if not explicit_path.is_absolute():
+            explicit_path = Path.cwd() / explicit_path
+        return explicit_path.resolve()
+
+    root_config = (root / DEFAULT_CONFIG_FILE_NAME).resolve()
+    if root_config.exists() and root_config.is_file():
+        return root_config
+
+    exe_config = (current_executable_path().parent / DEFAULT_CONFIG_FILE_NAME).resolve()
+    if exe_config.exists() and exe_config.is_file():
+        return exe_config
+
+    if GLOBAL_CONFIG_FILE.exists() and GLOBAL_CONFIG_FILE.is_file():
+        return GLOBAL_CONFIG_FILE.resolve()
+
+    return None
 
 
 def build_runtime_config(root: Path, args: argparse.Namespace) -> RuntimeConfig:
     merged = PartialConfig()
-    found_config_file = False
-    for config_path in resolve_config_paths(root):
-        if config_path.exists() and config_path.is_file():
-            found_config_file = True
-        merged = merge_partial_config(merged, parse_config_yaml(config_path))
+    selected_config = resolve_config_path(root, args)
+    found_config_file = bool(selected_config is not None and selected_config.exists() and selected_config.is_file())
+    if found_config_file and selected_config is not None:
+        merged = merge_partial_config(merged, parse_config_yaml(selected_config))
 
     if not found_config_file:
         merged.ignore_rules = default_common_ignore_rules().merge(merged.ignore_rules)
@@ -375,17 +480,62 @@ def build_runtime_config(root: Path, args: argparse.Namespace) -> RuntimeConfig:
     )
 
     config_rules = merged.ignore_rules
-    ignore_enabled = args.ignore or has_ignore_rules(config_rules) or has_ignore_rules(cli_rules)
-    effective_rules = config_rules.merge(cli_rules) if ignore_enabled else IgnoreRules()
+    ignore_enabled = getattr(args, "ignore", False) or has_ignore_rules(config_rules) or has_ignore_rules(cli_rules)
+    only_mode = getattr(args, "only", False)
+    
+    if only_mode:
+        effective_rules = config_rules
+        only_rules = cli_rules
+    else:
+        effective_rules = config_rules.merge(cli_rules) if ignore_enabled else IgnoreRules()
+        only_rules = IgnoreRules()
+
+    styling_mode = merged.styling_mode
+    if styling_mode is None and merged.styling is not None:
+        styling_mode = "full" if merged.styling else "minimal"
+    if getattr(args, "styling_mode", None):
+        styling_mode = normalize_styling_mode(args.styling_mode)
+    if styling_mode is None:
+        styling_mode = "full"
+
+    scan_emojis = True if merged.scan_emojis is None else merged.scan_emojis
+    cli_scan_emojis = parse_optional_bool_token(getattr(args, "scan_emojis", None))
+    if cli_scan_emojis is not None:
+        scan_emojis = cli_scan_emojis
+
+    scan_data = merged.scan_data if merged.scan_data is not None else "full"
+    cli_scan_data = normalize_scan_data_level(getattr(args, "scan_data", "")) if getattr(args, "scan_data", None) else None
+    if cli_scan_data is not None:
+        scan_data = cli_scan_data
+
+    scan_structure = merged.scan_structure if merged.scan_structure is not None else "dynamic"
+    cli_scan_structure = normalize_choice_token(getattr(args, "scan_structure", "")) if getattr(args, "scan_structure", None) else None
+    if cli_scan_structure in {"dynamic", "static"}:
+        scan_structure = cli_scan_structure
+
+    force_full = bool(getattr(args, "full", False))
+    ignore_hidden = True if merged.ignore_hidden is None else merged.ignore_hidden
+    ignore_empty = False if merged.ignore_empty is None else merged.ignore_empty
+    if force_full:
+        effective_rules = IgnoreRules()
+        only_rules = IgnoreRules()
+        ignore_hidden = False
+        ignore_empty = False
+        only_mode = False
 
     return RuntimeConfig(
         ignore_rules=effective_rules,
-        ignore_hidden=True if merged.ignore_hidden is None else merged.ignore_hidden,
-        ignore_empty=False if merged.ignore_empty is None else merged.ignore_empty,
+        only_rules=only_rules,
+        ignore_hidden=ignore_hidden,
+        ignore_empty=ignore_empty,
         scan_timeout=DEFAULT_SCAN_TIMEOUT_SECONDS if merged.scan_timeout is None else max(0, merged.scan_timeout),
-        styling=True if merged.styling is None else merged.styling,
+        styling_mode=styling_mode,
+        scan_emojis=scan_emojis,
+        scan_data=scan_data,
+        scan_structure=scan_structure,
         auto_update=True if merged.auto_update is None else merged.auto_update,
         auto_copy=False if merged.auto_copy is None else merged.auto_copy,
+        only_mode=only_mode,
     )
 
 
@@ -621,20 +771,59 @@ def modified_clock_time(ts: float) -> str:
     return text.lstrip("0").lower()
 
 
-def terminal_width() -> int:
-    env_columns = os.environ.get("COLUMNS")
-    if env_columns is not None:
-        try:
-            parsed = int(env_columns)
-            if parsed > 0:
-                return parsed
-        except ValueError:
-            pass
+def terminal_width_from_fd(fd: int) -> Optional[int]:
+    try:
+        columns = os.get_terminal_size(fd).columns
+        if columns > 0:
+            return columns
+    except OSError:
+        return None
+    return None
 
+
+def terminal_width_from_tty(preferred_fd: Optional[int] = None) -> Optional[int]:
+    if preferred_fd is not None:
+        preferred_columns = terminal_width_from_fd(preferred_fd)
+        if preferred_columns is not None:
+            return preferred_columns
+
+    streams = [sys.stdout, sys.stderr, sys.stdin]
+    for stream in streams:
+        try:
+            fileno = stream.fileno()
+        except Exception:
+            continue
+
+        columns = terminal_width_from_fd(fileno)
+        if columns is not None:
+            return columns
+
+    return None
+
+
+def terminal_width(allow_env_override: bool = True, preferred_fd: Optional[int] = None) -> int:
+    tty_columns = terminal_width_from_tty(preferred_fd=preferred_fd)
+    if tty_columns is not None:
+        return tty_columns
+
+    if allow_env_override:
+        env_columns = os.environ.get("COLUMNS")
+        if env_columns is not None:
+            try:
+                parsed = int(env_columns)
+                if parsed > 0:
+                    return parsed
+            except ValueError:
+                pass
+
+    saved_columns = os.environ.pop("COLUMNS", None) if not allow_env_override else None
     try:
         return shutil.get_terminal_size(fallback=(120, 24)).columns
     except OSError:
         return 120
+    finally:
+        if not allow_env_override and saved_columns is not None:
+            os.environ["COLUMNS"] = saved_columns
 
 
 def use_color_output(styling: bool) -> bool:
@@ -648,6 +837,10 @@ def use_color_output(styling: bool) -> bool:
     if os.environ.get("TERM") == "dumb":
         return False
     return sys.stdout.isatty()
+
+
+def runtime_style_enabled(config: RuntimeConfig) -> bool:
+    return config.styling_mode in {"full", "low"}
 
 
 def colorize(text: str, color_code: str, enabled: bool) -> str:
@@ -821,15 +1014,37 @@ def split_tree_walls(label: str) -> Tuple[str, str]:
     return (label[:idx], label[idx:])
 
 
-def column_layout(total_width: int) -> Tuple[int, int, int, int, str]:
+def column_layout(
+    total_width: int,
+    include_col1: bool,
+    include_col2: bool,
+    include_col3: bool,
+) -> Tuple[int, int, int, int, str]:
     separator = "   " if total_width >= 60 else " "
-    col1, col2, col3 = 10, 9, 9
-    min_col1, min_col2, min_col3 = 4, 4, 6
+
+    col1 = 10 if include_col1 else 0
+    col2 = 9 if include_col2 else 0
+    col3 = 9 if include_col3 else 0
+    min_col1 = 4 if include_col1 else 0
+    min_col2 = 4 if include_col2 else 0
+    min_col3 = 6 if include_col3 else 0
+
+    def col_count() -> int:
+        count = 0
+        if include_col1:
+            count += 1
+        if include_col2:
+            count += 1
+        if include_col3:
+            count += 1
+        return count
 
     def metadata_width() -> int:
-        return col1 + col2 + col3 + (2 * len(separator))
+        separators = max(0, col_count() - 1) * len(separator)
+        return col1 + col2 + col3 + separators
 
-    while total_width - metadata_width() < 16 and (col1 > min_col1 or col2 > min_col2 or col3 > min_col3):
+    label_target = 16 if col_count() > 0 else 1
+    while total_width - metadata_width() < label_target and (col1 > min_col1 or col2 > min_col2 or col3 > min_col3):
         if col1 > min_col1:
             col1 -= 1
         elif col2 > min_col2:
@@ -975,6 +1190,14 @@ def scan_tree(
     if path != root and should_ignore(rel_path, name, kind, extension, config.ignore_rules):
         return None
 
+    is_match = False
+    if path != root:
+        is_match = should_ignore(rel_path, name, kind, extension, config.only_rules)
+        if config.only_mode:
+            if kind != "dir" and not is_match:
+                return None
+        # if not only_mode, config.only_rules is empty and is_match is False
+
     try:
         st = path.lstat() if kind == "link" else path.stat()
     except OSError:
@@ -1034,6 +1257,10 @@ def scan_tree(
     node.size = total_size
     node.mtime = newest
 
+    if config.only_mode and path != root and not is_match and not children:
+        stats.dirs -= 1
+        return None
+
     if path != root and config.ignore_empty and not node.children:
         return None
 
@@ -1056,17 +1283,30 @@ def collect_lines(
     markers: Dict[str, str],
     rows: List[Tuple[str, str, str, str]],
     is_last: bool,
-    styling: bool,
+    style_enabled: bool,
+    scan_emojis: bool,
+    scan_structure: str,
 ) -> None:
-    if styling:
+    if scan_structure == "static":
+        connector = "  "
+        child_indent = "  "
+    elif style_enabled:
         connector = "└── " if is_last else "├── "
         child_indent = "    " if is_last else "│   "
-        dir_prefix = "📁 "
-        file_prefix = "📄 "
-        link_prefix = "🔗 "
     else:
-        connector = "`-- " if is_last else "|-- "
-        child_indent = "    " if is_last else "|   "
+        connector = "- "
+        child_indent = "  "
+
+    if style_enabled:
+        if scan_emojis:
+            dir_prefix = "📁 "
+            file_prefix = "📄 "
+            link_prefix = "🔗 "
+        else:
+            dir_prefix = "[D] "
+            file_prefix = "[F] "
+            link_prefix = "[L] "
+    else:
         dir_prefix = ""
         file_prefix = ""
         link_prefix = ""
@@ -1074,14 +1314,20 @@ def collect_lines(
     line_prefix = prefix + connector
 
     if node.kind == "dir":
-        label = f"{line_prefix}{dir_prefix}{node.basename}/"
+        if style_enabled:
+            label = f"{line_prefix}{dir_prefix}{node.basename}/"
+        else:
+            label = f"{line_prefix}{node.basename}/"
         col1 = f"{dir_file_count(node)} files"
         col2 = human_size(node.size)
         col3 = relative_age(node.mtime)
     elif node.kind == "file":
         marker = markers.get(node.rel_path, "")
         marker_text = f" [{marker}]" if marker else ""
-        label = f"{line_prefix}{file_prefix}{node.basename}{marker_text}"
+        if style_enabled:
+            label = f"{line_prefix}{file_prefix}{node.basename}{marker_text}"
+        else:
+            label = f"{line_prefix}{node.basename}{marker_text}"
         col1 = f"{node.lines}L"
         col2 = human_size(node.size)
         col3 = relative_age(node.mtime)
@@ -1091,7 +1337,10 @@ def collect_lines(
             target_text = f" -> {target}"
         except OSError:
             target_text = ""
-        label = f"{line_prefix}{link_prefix}{node.basename}{target_text}"
+        if style_enabled:
+            label = f"{line_prefix}{link_prefix}{node.basename}{target_text}"
+        else:
+            label = f"{line_prefix}{node.basename}{target_text}"
         col1 = ""
         col2 = "link"
         col3 = relative_age(node.mtime)
@@ -1101,7 +1350,7 @@ def collect_lines(
     if node.kind == "dir":
         child_prefix = prefix + child_indent
         for idx, child in enumerate(node.children):
-            collect_lines(child, child_prefix, markers, rows, idx == len(node.children) - 1, styling)
+            collect_lines(child, child_prefix, markers, rows, idx == len(node.children) - 1, style_enabled, scan_emojis, scan_structure)
 
 
 def shorten_path(rel: str) -> str:
@@ -1112,11 +1361,16 @@ def shorten_path(rel: str) -> str:
 def render_summary(
     stats: ScanStats,
     elapsed_ms: int,
-    styling: bool,
+    styling_mode: str,
+    scan_data: str,
+    scan_emojis: bool,
     scan_timeout: int,
     total_width: int,
     use_color: bool,
 ) -> str:
+    if scan_data == "minimal":
+        return ""
+
     types_sorted = sorted(stats.type_counts.items(), key=lambda item: (-item[1], item[0]))
     types_text = "   ".join([f"{name}: {count}" for name, count in types_sorted[:6]]) or "none"
 
@@ -1126,8 +1380,10 @@ def render_summary(
     newest_age = relative_age(stats.newest[1]) if stats.newest else "n/a"
     now_date = datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d")
     now_clock = modified_clock_time(time.time())
+    scanned_prefix = "⚡ scanned in" if scan_emojis else "scanned in"
+    timeout_prefix = "⚠ scan timeout reached" if scan_emojis else "scan timeout reached"
 
-    if styling:
+    if has_summary_box(styling_mode):
         width = max(10, total_width)
         left_divider_width = min(22, max(3, width // 3))
         right_divider_width = max(1, width - left_divider_width - 3)
@@ -1157,106 +1413,183 @@ def render_summary(
         lines.append("┌" + "─" * max(0, width - 2) + "┐")
         lines.append(box_line(totals_line, align="center", content_color=f"{CLR_BOLD}{CLR_CYAN}"))
         lines.append("├" + "─" * left_divider_width + "┬" + "─" * right_divider_width + "┤")
-        lines.append(metric_line("largest", largest_name, largest_size, content_color=CLR_GREEN))
-        lines.append(metric_line("newest", newest_name, newest_age, content_color=CLR_BLUE))
-        lines.append(metric_line("types", types_text, content_color=CLR_MAGENTA))
+        if scan_data in {"full", "medium"}:
+            lines.append(metric_line("largest", largest_name, largest_size, content_color=CLR_GREEN))
+        if scan_data in {"full", "medium", "low"}:
+            lines.append(metric_line("newest", newest_name, newest_age, content_color=CLR_BLUE))
+        if scan_data == "full":
+            lines.append(metric_line("types", types_text, content_color=CLR_MAGENTA))
         lines.append("├" + "─" * left_divider_width + "┴" + "─" * right_divider_width + "┤")
         lines.append(
             box_line(
-                compose_left_center_right(f"⚡ scanned in {elapsed_ms}ms", now_date, now_clock, inner_width),
+                compose_left_center_right(f"{scanned_prefix} {elapsed_ms}ms", now_date, now_clock, inner_width),
                 content_color=f"{CLR_BOLD}{CLR_MAGENTA}",
             )
         )
         if stats.timed_out and scan_timeout > 0:
-            lines.append(box_line(f"⚠ scan timeout reached ({scan_timeout}s), results are partial", content_color=f"{CLR_BOLD}{CLR_RED}"))
+            lines.append(
+                box_line(
+                    f"{timeout_prefix} ({scan_timeout}s), results are partial",
+                    content_color=f"{CLR_BOLD}{CLR_RED}",
+                )
+            )
         lines.append("└" + "─" * max(0, width - 2) + "┘")
         return "\n".join(lines)
 
-    lines = [
-        fit_cell(
-            f"{stats.files} files   {stats.dirs} dirs   {stats.links} link   +{stats.hidden} hidden   {stats.lines:,} lines   {human_size(stats.size)}",
-            max(1, total_width),
-            "center",
-        ),
-        f"largest: {largest_name} ({largest_size})",
-        f"newest: {newest_name} ({newest_age})",
-        f"types: {types_text}",
-        compose_left_center_right(f"scanned in {elapsed_ms}ms", now_date, now_clock, max(1, total_width)),
-    ]
-    if stats.timed_out and scan_timeout > 0:
-        lines.append(f"scan timeout reached ({scan_timeout}s), results are partial")
-    return "\n".join([fit_cell(line, max(1, total_width)) for line in lines])
+    if styling_mode in {"low", "minimal"}:
+        lines = [
+            fit_cell(
+                f"{stats.files} files   {stats.dirs} dirs   {stats.links} link   +{stats.hidden} hidden   {stats.lines:,} lines   {human_size(stats.size)}",
+                max(1, total_width),
+                "center",
+            )
+        ]
+        if scan_data in {"full", "medium"}:
+            lines.append(compose_left_right(f"largest: {largest_name}", largest_size, max(1, total_width)))
+        if scan_data in {"full", "medium", "low"}:
+            lines.append(compose_left_right(f"newest: {newest_name}", newest_age, max(1, total_width)))
+        if scan_data == "full":
+            lines.append(fit_cell(f"types: {types_text}", max(1, total_width)))
+        lines.append(compose_left_center_right(f"{scanned_prefix} {elapsed_ms}ms", now_date, now_clock, max(1, total_width)))
+        if stats.timed_out and scan_timeout > 0:
+            lines.append(fit_cell(f"{timeout_prefix} ({scan_timeout}s), results are partial", max(1, total_width)))
+        if use_color:
+            colorized: List[str] = []
+            for idx, line in enumerate(lines):
+                if idx == 0:
+                    colorized.append(colorize(line, f"{CLR_BOLD}{CLR_CYAN}", True))
+                elif "largest:" in line:
+                    colorized.append(colorize(line, CLR_GREEN, True))
+                elif "newest:" in line:
+                    colorized.append(colorize(line, CLR_BLUE, True))
+                elif "types:" in line:
+                    colorized.append(colorize(line, CLR_MAGENTA, True))
+                elif "scanned in" in line:
+                    colorized.append(colorize(line, f"{CLR_BOLD}{CLR_MAGENTA}", True))
+                elif "scan timeout" in line:
+                    colorized.append(colorize(line, f"{CLR_BOLD}{CLR_RED}", True))
+                else:
+                    colorized.append(line)
+            return "\n".join(colorized)
+        return "\n".join(lines)
+
+    return ""
 
 
-def render_tree(root: Node, markers: Dict[str, str], stats: ScanStats, elapsed_ms: int, config: RuntimeConfig) -> str:
-    total_width = terminal_width()
-    label_width, col1_width, col2_width, col3_width, separator = column_layout(total_width)
-    color_output = use_color_output(config.styling)
+def render_tree(
+    root: Node,
+    markers: Dict[str, str],
+    stats: ScanStats,
+    elapsed_ms: int,
+    config: RuntimeConfig,
+    total_width_override: Optional[int] = None,
+) -> str:
+    total_width = max(1, total_width_override if total_width_override is not None else terminal_width())
+    show_count, show_size, show_modified = data_columns_enabled(config.scan_data)
+    label_width, col1_width, col2_width, col3_width, separator = column_layout(
+        total_width,
+        show_count,
+        show_size,
+        show_modified,
+    )
+    style_enabled = has_tree_structure(config.styling_mode)
+    color_output = use_color_output(runtime_style_enabled(config))
 
     def row_label_color(label: str) -> str:
-        if "📁 " in label or label.rstrip().endswith("/"):
+        plain = strip_ansi(label)
+        if "[D] " in plain or "📁 " in plain or plain.rstrip().endswith("/"):
             return f"{CLR_BOLD}{CLR_BLUE}"
-        if "🔗 " in label or " -> " in label:
+        if "[L] " in plain or "🔗 " in plain or " -> " in plain:
             return f"{CLR_BOLD}{CLR_CYAN}"
         return CLR_CYAN
 
+    def assemble_row(label_cell: str, col1_cell: str, col2_cell: str, col3_cell: str) -> str:
+        row = label_cell
+        metas: List[str] = []
+        if show_count:
+            metas.append(col1_cell)
+        if show_size:
+            metas.append(col2_cell)
+        if show_modified:
+            metas.append(col3_cell)
+        if metas:
+            row += metas[0]
+            for meta in metas[1:]:
+                row += separator + meta
+        return row
+
     rows: List[Tuple[str, str, str, str]] = []
     for idx, child in enumerate(root.children):
-        collect_lines(child, "", markers, rows, idx == len(root.children) - 1, config.styling)
+        collect_lines(
+            child,
+            "",
+            markers,
+            rows,
+            idx == len(root.children) - 1,
+            style_enabled,
+            config.scan_emojis,
+            config.scan_structure,
+        )
 
-    root_label = f"📁 {root.path.name}/" if config.styling else f"{root.path.name}/"
+    if style_enabled:
+        if config.scan_emojis:
+            root_label = f"📁 {root.path.name}/"
+        else:
+            root_label = f"[D] {root.path.name}/"
+    else:
+        root_label = f"{root.path.name}/"
+
     header_label = fit_cell(root_label, label_width)
-    header_files = fit_cell("files", col1_width, "right")
-    header_size = fit_cell("size", col2_width, "right")
-    header_modified = fit_cell("modified", col3_width, "right")
+    header_files = fit_cell("files", col1_width, "right") if show_count else ""
+    header_size = fit_cell("size", col2_width, "right") if show_size else ""
+    header_modified = fit_cell("modified", col3_width, "right") if show_modified else ""
 
     if color_output:
         header_label = colorize(header_label, f"{CLR_BOLD}{CLR_BLUE}", True)
-        header_files = colorize(header_files, f"{CLR_BOLD}{CLR_CYAN}", True)
-        header_size = colorize(header_size, f"{CLR_BOLD}{CLR_GREEN}", True)
-        header_modified = colorize(header_modified, f"{CLR_BOLD}{CLR_BLUE}", True)
+        if show_count:
+            header_files = colorize(header_files, f"{CLR_BOLD}{CLR_CYAN}", True)
+        if show_size:
+            header_size = colorize(header_size, f"{CLR_BOLD}{CLR_GREEN}", True)
+        if show_modified:
+            header_modified = colorize(header_modified, f"{CLR_BOLD}{CLR_BLUE}", True)
 
-    output_lines = [
-        header_label
-        + header_files
-        + separator
-        + header_size
-        + separator
-        + header_modified
-    ]
+    output_lines = [assemble_row(header_label, header_files, header_size, header_modified)]
+
     for label, col1, col2, col3 in rows:
         label_cell = fit_cell(label, label_width)
-        col1_cell = fit_cell(col1, col1_width, "right")
-        col2_cell = fit_cell(col2, col2_width, "right")
-        col3_cell = fit_cell(col3, col3_width, "right")
+        col1_cell = fit_cell(col1, col1_width, "right") if show_count else ""
+        col2_cell = fit_cell(col2, col2_width, "right") if show_size else ""
+        col3_cell = fit_cell(col3, col3_width, "right") if show_modified else ""
 
         if color_output:
-            walls, content = split_tree_walls(label_cell)
-            label_cell = walls + colorize(content, row_label_color(label), True)
-            col1_cell = colorize(col1_cell, CLR_CYAN, True)
-            col2_cell = colorize(col2_cell, CLR_GREEN, True)
-            col3_cell = colorize(col3_cell, CLR_BLUE, True)
+            if style_enabled:
+                walls, content = split_tree_walls(label_cell)
+                label_cell = walls + colorize(content, row_label_color(label), True)
+            else:
+                label_cell = colorize(label_cell, row_label_color(label), True)
+            if show_count:
+                col1_cell = colorize(col1_cell, CLR_CYAN, True)
+            if show_size:
+                col2_cell = colorize(col2_cell, CLR_GREEN, True)
+            if show_modified:
+                col3_cell = colorize(col3_cell, CLR_BLUE, True)
 
-        output_lines.append(
-            label_cell
-            + col1_cell
-            + separator
-            + col2_cell
-            + separator
-            + col3_cell
-        )
+        output_lines.append(assemble_row(label_cell, col1_cell, col2_cell, col3_cell))
 
-    output_lines.append("")
-    output_lines.append(
-        render_summary(
-            stats,
-            elapsed_ms,
-            config.styling,
-            config.scan_timeout,
-            total_width,
-            color_output,
-        )
+    summary = render_summary(
+        stats,
+        elapsed_ms,
+        config.styling_mode,
+        config.scan_data,
+        config.scan_emojis,
+        config.scan_timeout,
+        total_width,
+        color_output,
     )
+    if summary:
+        output_lines.append("")
+        output_lines.append(summary)
+
     return "\n".join(output_lines)
 
 
@@ -1290,11 +1623,42 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--disable-auto-update", action="store_true", help="Disable auto-update in config.yaml")
     parser.add_argument("--auto-update-status", action="store_true", help="Show effective auto-update state")
     parser.add_argument("--no-auto-update", action="store_true", help="Skip auto-update check for this run")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Show everything; bypass all ignore rules and hidden/empty filtering",
+    )
+    parser.add_argument(
+        "--styling-mode",
+        choices=sorted(VALID_STYLING_MODES),
+        help="Tree styling level: full, low, minimal",
+    )
+    parser.add_argument(
+        "--scan-emojis",
+        choices=["true", "false"],
+        help="Enable or disable scan emojis",
+    )
+    parser.add_argument(
+        "--scan-data",
+        choices=sorted(VALID_SCAN_DATA_LEVELS),
+        help="Data density: full, medium, low, minimal",
+    )
+    parser.add_argument(
+        "--scan-structure",
+        choices=["dynamic", "static"],
+        help="Tree structure rendering: dynamic or static",
+    )
+    parser.add_argument(
+        "--config",
+        dest="config_file",
+        help="Explicit path to config.yaml to load last (highest priority)",
+    )
     parser.add_argument("--ignore", action="store_true", help="Enable ignore filters")
-    parser.add_argument("-f", "--paths", nargs="*", default=[], help="Ignore specific paths")
-    parser.add_argument("-t", "--types", nargs="*", default=[], help="Ignore types: file, dir, link")
-    parser.add_argument("-e", "--extensions", nargs="*", default=[], help="Ignore extensions")
-    parser.add_argument("-n", "--names", nargs="*", default=[], help="Ignore names")
+    parser.add_argument("--only", action="store_true", help="Show only the specified files/folders")
+    parser.add_argument("-f", "--paths", nargs="*", default=[], help="Filter specific paths")
+    parser.add_argument("-t", "--types", nargs="*", default=[], help="Filter types: file, dir, link")
+    parser.add_argument("-e", "--extensions", nargs="*", default=[], help="Filter extensions")
+    parser.add_argument("-n", "--names", nargs="*", default=[], help="Filter names")
     return parser.parse_args(argv)
 
 
