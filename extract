@@ -6,6 +6,7 @@ import argparse
 import importlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -36,9 +37,36 @@ AUTO_UPDATE_INTERVAL_SECONDS = 24 * 60 * 60
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10
 DEFAULT_SCAN_TIMEOUT_SECONDS = 60
 DEFAULT_CONFIG_FILE_NAME = "config.yaml"
-GLOBAL_CONFIG_DIR = Path.home() / ".config" / "extract"
+_IS_WINDOWS = platform.system() == "Windows"
+
+
+def _platform_config_dir() -> Path:
+    """Return the OS-appropriate user config directory for extract."""
+    if _IS_WINDOWS:
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return Path(appdata) / "extract"
+        return Path.home() / "AppData" / "Roaming" / "extract"
+    return Path.home() / ".config" / "extract"
+
+
+def _platform_cache_dir() -> Path:
+    """Return the OS-appropriate user cache directory for extract."""
+    if _IS_WINDOWS:
+        localappdata = os.environ.get("LOCALAPPDATA")
+        if localappdata:
+            return Path(localappdata) / "extract"
+        return Path.home() / "AppData" / "Local" / "extract"
+    # macOS: use XDG_CACHE_HOME if set, otherwise ~/.cache
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache:
+        return Path(xdg_cache) / "extract"
+    return Path.home() / ".cache" / "extract"
+
+
+GLOBAL_CONFIG_DIR = _platform_config_dir()
 GLOBAL_CONFIG_FILE = GLOBAL_CONFIG_DIR / DEFAULT_CONFIG_FILE_NAME
-STATE_FILE = Path.home() / ".cache" / "extract" / "state.json"
+STATE_FILE = _platform_cache_dir() / "state.json"
 ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 CLR_RESET = "\033[0m"
 CLR_BOLD = "\033[1m"
@@ -627,14 +655,26 @@ def apply_update_script(executable_path: Path, new_script: str) -> None:
     backup_path = executable_path.with_name(f".{executable_path.name}.bak")
     old_mode = 0o755
     if executable_path.exists():
-        old_mode = executable_path.stat().st_mode & 0o777
+        try:
+            old_mode = executable_path.stat().st_mode & 0o777
+        except OSError:
+            pass
         shutil.copy2(executable_path, backup_path)
 
     try:
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
             handle.write(new_script)
-        os.chmod(tmp_path, old_mode | 0o111)
+        try:
+            # chmod is meaningful on Unix; on Windows this is best-effort
+            os.chmod(tmp_path, old_mode | 0o111)
+        except (OSError, AttributeError, NotImplementedError):
+            pass
         os.replace(tmp_path, executable_path)
+        try:
+            # Re-apply permissions after atomic replace on Unix
+            os.chmod(executable_path, old_mode | 0o111)
+        except (OSError, AttributeError, NotImplementedError):
+            pass
         backup_path.unlink(missing_ok=True)
     except Exception:
         try:
@@ -826,6 +866,34 @@ def terminal_width(allow_env_override: bool = True, preferred_fd: Optional[int] 
             os.environ["COLUMNS"] = saved_columns
 
 
+def _try_enable_windows_ansi() -> bool:
+    """Attempt to enable ANSI/VT100 escape processing on Windows consoles.
+
+    Returns True if the mode was successfully enabled, False otherwise.
+    This is a no-op on non-Windows platforms.
+    """
+    if not _IS_WINDOWS:
+        return False
+    try:
+        import ctypes
+        import ctypes.wintypes
+        STD_OUTPUT_HANDLE = ctypes.c_ulong(-11)
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        mode = ctypes.wintypes.DWORD(0)
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        new_mode = mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        return bool(kernel32.SetConsoleMode(handle, new_mode))
+    except Exception:
+        return False
+
+
+# Enable Windows ANSI at import time so color detection works correctly
+_WINDOWS_ANSI_ENABLED: bool = _try_enable_windows_ansi()
+
+
 def use_color_output(styling: bool) -> bool:
     if not styling:
         return False
@@ -836,6 +904,9 @@ def use_color_output(styling: bool) -> bool:
         return True
     if os.environ.get("TERM") == "dumb":
         return False
+    if _IS_WINDOWS and _WINDOWS_ANSI_ENABLED:
+        # isatty() is True for a real Windows console; colour is safe
+        return sys.stdout.isatty()
     return sys.stdout.isatty()
 
 
@@ -1123,6 +1194,8 @@ def should_ignore(rel_path: str, name: str, kind: str, extension: str, rules: Ig
 
 def git_markers(root: Path) -> Dict[str, str]:
     markers: Dict[str, str] = {}
+    # On Windows, suppress the console window that child processes would open
+    _subprocess_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         probe = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
@@ -1130,6 +1203,7 @@ def git_markers(root: Path) -> Dict[str, str]:
             stderr=subprocess.DEVNULL,
             text=True,
             check=False,
+            creationflags=_subprocess_flags,
         )
         if probe.returncode != 0:
             return markers
@@ -1140,6 +1214,7 @@ def git_markers(root: Path) -> Dict[str, str]:
             stderr=subprocess.DEVNULL,
             text=True,
             check=False,
+            creationflags=_subprocess_flags,
         )
         if result.returncode != 0:
             return markers
@@ -1613,6 +1688,35 @@ def copy_to_clipboard(content: str) -> Tuple[bool, Optional[str]]:
     return (False, None)
 
 
+def _bat_launcher_content(python_exe: str, script_path: str) -> str:
+    """Return the content of a Windows .bat launcher for extract."""
+    return (
+        "@echo off\r\n"
+        f'"{python_exe}" "{script_path}" %*\r\n'
+    )
+
+
+def install_bat_launcher(dest_dir: Optional[Path] = None) -> int:
+    """Write an extract.bat launcher next to the script (or to dest_dir).
+
+    Returns 0 on success, 1 on failure.
+    """
+    script_path = current_executable_path()
+    python_exe = sys.executable or "python"
+    target_dir = dest_dir if dest_dir is not None else script_path.parent
+    bat_path = target_dir / "extract.bat"
+    content = _bat_launcher_content(python_exe, str(script_path))
+    try:
+        bat_path.parent.mkdir(parents=True, exist_ok=True)
+        bat_path.write_text(content, encoding="utf-8")
+        print(f"extract.bat written to {bat_path}")
+        print(f"Add {target_dir} to your PATH to run 'extract' from any directory.")
+        return 0
+    except OSError as exc:
+        print(f"error: could not write extract.bat: {exc}", file=sys.stderr)
+        return 1
+
+
 def parse_args(argv: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="extract", description="Extract a rich directory tree.")
     parser.add_argument("path", nargs="?", default=".", help="Path to directory to extract")
@@ -1623,6 +1727,13 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--disable-auto-update", action="store_true", help="Disable auto-update in config.yaml")
     parser.add_argument("--auto-update-status", action="store_true", help="Show effective auto-update state")
     parser.add_argument("--no-auto-update", action="store_true", help="Skip auto-update check for this run")
+    parser.add_argument(
+        "--install-bat",
+        nargs="?",
+        const="",
+        metavar="DIR",
+        help="(Windows) Write an extract.bat launcher. Optionally specify destination directory.",
+    )
     parser.add_argument(
         "--full",
         action="store_true",
@@ -1713,6 +1824,11 @@ def main(argv: List[str]) -> int:
     if args.self_update:
         result, _updated, _remote_version = run_self_update(executable_path, silent=False)
         return result
+
+    install_bat_raw = getattr(args, "install_bat", None)
+    if install_bat_raw is not None:
+        dest: Optional[Path] = Path(install_bat_raw).expanduser() if install_bat_raw else None
+        return install_bat_launcher(dest)
 
     target = Path(args.path).expanduser().resolve()
 

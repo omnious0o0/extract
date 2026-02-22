@@ -37,8 +37,28 @@ A fast directory scanner that gives you and your AI agent a clean, readable tree
 
 ## Installation
 
+> **Requires Python 3.8+** — install it from [python.org](https://www.python.org/downloads/) if needed.
+
+### Linux / macOS
+
 ```bash
 curl -sSL https://raw.githubusercontent.com/omnious0o0/extract/main/.extract/install.sh | bash
+```
+
+### Windows (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/omnious0o0/extract/main/.extract/install.ps1 | iex
+```
+
+This automatically:
+- Downloads the `extract` script
+- Creates an `extract.bat` launcher so you can run `extract` directly from CMD or PowerShell
+- Adds the install directory to your user `PATH`
+
+To install into a custom directory:
+```powershell
+.\install.ps1 -InstallDir C:\tools\extract
 ```
 
 ## Usage
