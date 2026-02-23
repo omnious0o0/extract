@@ -3,7 +3,10 @@
 set -euo pipefail
 
 PROJECT_REPO="omnious0o0/extract"
-SOURCE_URL="${EXTRACT_SOURCE_URL:-https://raw.githubusercontent.com/${PROJECT_REPO}/main/extract}"
+RELEASE_DOWNLOAD_BASE_URL="https://github.com/${PROJECT_REPO}/releases/latest/download"
+SOURCE_URL="${EXTRACT_SOURCE_URL:-${RELEASE_DOWNLOAD_BASE_URL}/extract}"
+SOURCE_SHA256_URL="${EXTRACT_SOURCE_SHA256_URL:-${RELEASE_DOWNLOAD_BASE_URL}/extract.sha256}"
+SOURCE_SHA256="${EXTRACT_SOURCE_SHA256:-}"
 
 DEFAULT_INSTALL_DIR="${HOME}/.local/bin"
 INSTALL_DIR=""
@@ -15,6 +18,7 @@ QUIET="0"
 
 TARGET=""
 DOWNLOAD_FILE=""
+CHECKSUM_FILE=""
 STAGED_FILE=""
 BACKUP_FILE=""
 RESTORE_MODE="none"
@@ -153,8 +157,9 @@ cleanup() {
 
   if [[ ${status} -ne 0 ]]; then
     if [[ "${RESTORE_MODE}" == "replace" && -n "${BACKUP_FILE}" && -f "${BACKUP_FILE}" && -n "${TARGET}" ]]; then
-      cp "${BACKUP_FILE}" "${TARGET}" || true
+      mv -f "${BACKUP_FILE}" "${TARGET}" || cp "${BACKUP_FILE}" "${TARGET}" || true
       chmod 0755 "${TARGET}" || true
+      BACKUP_FILE=""
       warn "Recovered previous extract binary after failed install"
     elif [[ "${RESTORE_MODE}" == "remove" && -n "${TARGET}" ]]; then
       rm -f "${TARGET}" || true
@@ -163,6 +168,9 @@ cleanup() {
 
   if [[ -n "${DOWNLOAD_FILE}" && -f "${DOWNLOAD_FILE}" ]]; then
     rm -f "${DOWNLOAD_FILE}" || true
+  fi
+  if [[ -n "${CHECKSUM_FILE}" && -f "${CHECKSUM_FILE}" ]]; then
+    rm -f "${CHECKSUM_FILE}" || true
   fi
   if [[ -n "${STAGED_FILE}" && -f "${STAGED_FILE}" ]]; then
     rm -f "${STAGED_FILE}" || true
@@ -174,27 +182,38 @@ cleanup() {
   return ${status}
 }
 
-download_extract() {
-  local destination="$1"
+download_file() {
+  local source_url="$1"
+  local destination="$2"
   if command -v curl >/dev/null 2>&1; then
     if [[ "${QUIET}" == "1" ]]; then
-      curl --silent --fail --show-error --location --connect-timeout 10 --retry 3 --retry-delay 1 --retry-connrefused "${SOURCE_URL}" -o "${destination}"
+      curl --silent --fail --show-error --location --connect-timeout 10 --retry 3 --retry-delay 1 --retry-connrefused "${source_url}" -o "${destination}"
     else
-      curl --fail --show-error --location --connect-timeout 10 --retry 3 --retry-delay 1 --retry-connrefused "${SOURCE_URL}" -o "${destination}"
+      curl --fail --show-error --location --connect-timeout 10 --retry 3 --retry-delay 1 --retry-connrefused "${source_url}" -o "${destination}"
     fi
     return 0
   fi
 
   if command -v wget >/dev/null 2>&1; then
     if [[ "${QUIET}" == "1" ]]; then
-      wget -q -O "${destination}" "${SOURCE_URL}"
+      wget -q --tries=3 --timeout=10 --waitretry=1 -O "${destination}" "${source_url}"
     else
-      wget -O "${destination}" "${SOURCE_URL}"
+      wget --tries=3 --timeout=10 --waitretry=1 -O "${destination}" "${source_url}"
     fi
     return 0
   fi
 
-  die "neither curl nor wget is available for downloading extract"
+  die "neither curl nor wget is available for downloading"
+}
+
+download_extract() {
+  local destination="$1"
+  download_file "${SOURCE_URL}" "${destination}"
+}
+
+download_checksum() {
+  local destination="$1"
+  download_file "${SOURCE_SHA256_URL}" "${destination}"
 }
 
 validate_payload() {
@@ -205,6 +224,39 @@ validate_payload() {
   grep -q '^VERSION = ' "${file_path}" || die "downloaded file missing VERSION metadata"
   grep -q '^def main(' "${file_path}" || die "downloaded file missing entrypoint"
   python3 -m py_compile "${file_path}" >/dev/null 2>&1 || die "downloaded file failed Python syntax validation"
+}
+
+validate_checksum() {
+  local payload_path="$1"
+  local checksum_path="$2"
+  local expected="${SOURCE_SHA256}"
+  local actual
+
+  if [[ -z "${expected}" ]]; then
+    if [[ ! -f "${checksum_path}" ]]; then
+      die "checksum file not found"
+    fi
+    IFS=$' \t' read -r expected _ < "${checksum_path}" || true
+  fi
+
+  expected="$(printf "%s" "${expected}" | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
+  [[ "${expected}" =~ ^[0-9a-f]{64}$ ]] || die "invalid expected SHA-256 checksum"
+
+  actual="$(python3 - "${payload_path}" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+digest = hashlib.sha256()
+with path.open("rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
+)"
+
+  [[ "${actual}" == "${expected}" ]] || die "downloaded file checksum mismatch"
 }
 
 verify_executable() {
@@ -239,7 +291,13 @@ ensure_global_access() {
 
     if ln -sfn "${installed_path}" "${shim_path}" 2>/dev/null; then
       if verify_executable "${shim_path}"; then
-        ok "Linked 'extract' into ${link_dir} for global command access"
+        if path_has_dir "${link_dir}"; then
+          ok "Linked 'extract' into ${link_dir} for global command access"
+        else
+          warn "Installed link to ${shim_path}, but ${link_dir} is not in PATH"
+          printf "Add this line to your shell profile:\n"
+          printf "  export PATH=\"%s:\$PATH\"\n" "${link_dir}"
+        fi
         return 0
       fi
     fi
@@ -247,7 +305,13 @@ ensure_global_access() {
     cp "${installed_path}" "${shim_path}"
     chmod 0755 "${shim_path}"
     if verify_executable "${shim_path}"; then
-      ok "Installed command shim to ${shim_path} for global access"
+      if path_has_dir "${link_dir}"; then
+        ok "Installed command shim to ${shim_path} for global access"
+      else
+        warn "Installed command shim to ${shim_path}, but ${link_dir} is not in PATH"
+        printf "Add this line to your shell profile:\n"
+        printf "  export PATH=\"%s:\$PATH\"\n" "${link_dir}"
+      fi
       return 0
     fi
   fi
@@ -308,6 +372,7 @@ require_cmd mv
 require_cmd grep
 require_cmd head
 require_cmd python3
+require_cmd tr
 
 if [[ "${QUIET}" != "1" ]]; then
   printf "%b" "${CLR_BLUE}"
@@ -325,6 +390,16 @@ mkdir -p "${INSTALL_DIR}"
 DOWNLOAD_FILE="$(mktemp "${TMPDIR:-/tmp}/extract.download.XXXXXX")"
 info "Downloading extract from ${SOURCE_URL}"
 download_extract "${DOWNLOAD_FILE}"
+
+if [[ -n "${SOURCE_SHA256}" ]]; then
+  info "Using pinned checksum from EXTRACT_SOURCE_SHA256"
+else
+  CHECKSUM_FILE="$(mktemp "${TMPDIR:-/tmp}/extract.checksum.XXXXXX")"
+  info "Downloading checksum metadata from ${SOURCE_SHA256_URL}"
+  download_checksum "${CHECKSUM_FILE}"
+fi
+
+validate_checksum "${DOWNLOAD_FILE}" "${CHECKSUM_FILE}"
 validate_payload "${DOWNLOAD_FILE}"
 
 STAGED_FILE="$(mktemp "${INSTALL_DIR}/.extract.staged.XXXXXX")"
@@ -333,7 +408,7 @@ chmod 0755 "${STAGED_FILE}"
 verify_executable "${STAGED_FILE}" || die "staged extract binary failed execution check"
 
 if [[ -f "${TARGET}" ]]; then
-  BACKUP_FILE="$(mktemp "${TMPDIR:-/tmp}/extract.backup.XXXXXX")"
+  BACKUP_FILE="$(mktemp "${INSTALL_DIR}/.extract.backup.XXXXXX")"
   cp "${TARGET}" "${BACKUP_FILE}"
   RESTORE_MODE="replace"
   info "Backed up existing extract binary"

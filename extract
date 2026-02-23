@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -29,15 +31,22 @@ except Exception:
 
 VERSION = "1.0.0"
 PROJECT_REPO = "omnious0o0/extract"
+RELEASE_DOWNLOAD_BASE_URL = f"https://github.com/{PROJECT_REPO}/releases/latest/download"
 REMOTE_EXTRACT_URL = os.environ.get(
     "EXTRACT_SOURCE_URL",
-    f"https://raw.githubusercontent.com/{PROJECT_REPO}/main/extract",
+    f"{RELEASE_DOWNLOAD_BASE_URL}/extract",
 )
+REMOTE_EXTRACT_SHA256_URL = os.environ.get(
+    "EXTRACT_SOURCE_SHA256_URL",
+    f"{RELEASE_DOWNLOAD_BASE_URL}/extract.sha256",
+)
+REMOTE_EXTRACT_SHA256 = os.environ.get("EXTRACT_SOURCE_SHA256", "").strip()
 AUTO_UPDATE_INTERVAL_SECONDS = 24 * 60 * 60
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10
 DEFAULT_SCAN_TIMEOUT_SECONDS = 60
 DEFAULT_CONFIG_FILE_NAME = "config.yaml"
 _IS_WINDOWS = platform.system() == "Windows"
+SHA256_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _platform_config_dir() -> Path:
@@ -152,7 +161,7 @@ class RuntimeConfig:
     scan_emojis: bool = False
     scan_data: str = "full"
     scan_structure: str = "dynamic"
-    auto_update: bool = True
+    auto_update: bool = False
     auto_copy: bool = False
     only_mode: bool = False
 
@@ -195,9 +204,9 @@ def write_json_file(path: Path, payload: Dict[str, object]) -> None:
 
 def parse_bool_token(value: str) -> Optional[bool]:
     normalized = value.strip().strip('"\'').lower()
-    if normalized in {"true", "1", "yes", "on", "y", "t", "ture"}:
+    if normalized in {"true", "1", "yes", "on", "y", "t"}:
         return True
-    if normalized in {"false", "0", "no", "off", "n", "f", "flase"}:
+    if normalized in {"false", "0", "no", "off", "n", "f"}:
         return False
     return None
 
@@ -344,7 +353,6 @@ def parse_config_yaml(file_path: Path) -> PartialConfig:
         "ignore_hidden",
         "ignore_empty",
         "scan_timeout",
-        "scan_timout",
         "styling",
         "styling_mode",
         "scan_emojis",
@@ -490,6 +498,16 @@ def resolve_config_path(root: Path, args: argparse.Namespace) -> Optional[Path]:
     return None
 
 
+def resolve_config_write_path(root: Path, args: argparse.Namespace) -> Path:
+    explicit_raw = getattr(args, "config_file", None)
+    if explicit_raw:
+        explicit_path = Path(explicit_raw).expanduser()
+        if not explicit_path.is_absolute():
+            explicit_path = Path.cwd() / explicit_path
+        return explicit_path.resolve()
+    return (root / DEFAULT_CONFIG_FILE_NAME).resolve()
+
+
 def build_runtime_config(root: Path, args: argparse.Namespace) -> RuntimeConfig:
     merged = PartialConfig()
     selected_config = resolve_config_path(root, args)
@@ -510,9 +528,9 @@ def build_runtime_config(root: Path, args: argparse.Namespace) -> RuntimeConfig:
     config_rules = merged.ignore_rules
     ignore_enabled = getattr(args, "ignore", False) or has_ignore_rules(config_rules) or has_ignore_rules(cli_rules)
     only_mode = getattr(args, "only", False)
-    
+
     if only_mode:
-        effective_rules = config_rules
+        effective_rules = IgnoreRules()
         only_rules = cli_rules
     else:
         effective_rules = config_rules.merge(cli_rules) if ignore_enabled else IgnoreRules()
@@ -524,9 +542,9 @@ def build_runtime_config(root: Path, args: argparse.Namespace) -> RuntimeConfig:
     if getattr(args, "styling_mode", None):
         styling_mode = normalize_styling_mode(args.styling_mode)
     if styling_mode is None:
-        styling_mode = "full"
+        styling_mode = "low"
 
-    scan_emojis = True if merged.scan_emojis is None else merged.scan_emojis
+    scan_emojis = False if merged.scan_emojis is None else merged.scan_emojis
     cli_scan_emojis = parse_optional_bool_token(getattr(args, "scan_emojis", None))
     if cli_scan_emojis is not None:
         scan_emojis = cli_scan_emojis
@@ -561,7 +579,7 @@ def build_runtime_config(root: Path, args: argparse.Namespace) -> RuntimeConfig:
         scan_emojis=scan_emojis,
         scan_data=scan_data,
         scan_structure=scan_structure,
-        auto_update=True if merged.auto_update is None else merged.auto_update,
+        auto_update=False if merged.auto_update is None else merged.auto_update,
         auto_copy=False if merged.auto_copy is None else merged.auto_copy,
         only_mode=only_mode,
     )
@@ -626,15 +644,69 @@ def compare_versions(left: str, right: str) -> int:
     return 1 if left > right else -1
 
 
-def fetch_remote_extract() -> str:
+def fetch_remote_text(url: str) -> str:
     request = urllib.request.Request(
-        REMOTE_EXTRACT_URL,
+        url,
         headers={"User-Agent": f"extract/{VERSION}", "Accept": "text/plain"},
         method="GET",
     )
     with urllib.request.urlopen(request, timeout=DEFAULT_HTTP_TIMEOUT_SECONDS) as response:
         body = response.read().decode("utf-8")
         return body
+
+
+def fetch_remote_extract() -> str:
+    return fetch_remote_text(REMOTE_EXTRACT_URL)
+
+
+def fetch_remote_checksum_manifest() -> str:
+    return fetch_remote_text(REMOTE_EXTRACT_SHA256_URL)
+
+
+def parse_checksum_token(value: str) -> Optional[str]:
+    parts = value.strip().split()
+    if not parts:
+        return None
+    token = parts[0].strip().lower()
+    if SHA256_TOKEN_RE.fullmatch(token):
+        return token
+    return None
+
+
+def extract_checksum_from_manifest(manifest: str) -> Optional[str]:
+    for raw_line in manifest.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        token = parse_checksum_token(line)
+        if token is not None:
+            return token
+    return None
+
+
+def script_sha256(script: str) -> str:
+    return hashlib.sha256(script.encode("utf-8")).hexdigest()
+
+
+def expected_remote_sha256() -> str:
+    if REMOTE_EXTRACT_SHA256:
+        pinned = parse_checksum_token(REMOTE_EXTRACT_SHA256)
+        if pinned is None:
+            raise RuntimeError("invalid EXTRACT_SOURCE_SHA256 value; expected 64 hex chars")
+        return pinned
+
+    manifest = fetch_remote_checksum_manifest()
+    parsed = extract_checksum_from_manifest(manifest)
+    if parsed is None:
+        raise RuntimeError("remote checksum metadata missing")
+    return parsed
+
+
+def validate_remote_checksum(script: str) -> None:
+    expected = expected_remote_sha256()
+    actual = script_sha256(script)
+    if actual != expected:
+        raise RuntimeError("downloaded script checksum mismatch")
 
 
 def extract_remote_version(script: str) -> Optional[str]:
@@ -652,13 +724,20 @@ def apply_update_script(executable_path: Path, new_script: str) -> None:
     executable_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_fd, tmp_name = tempfile.mkstemp(prefix=f".{executable_path.name}.", suffix=".tmp", dir=str(executable_path.parent))
     tmp_path = Path(tmp_name)
-    backup_path = executable_path.with_name(f".{executable_path.name}.bak")
+    backup_path: Optional[Path] = None
     old_mode = 0o755
     if executable_path.exists():
         try:
             old_mode = executable_path.stat().st_mode & 0o777
         except OSError:
             pass
+        backup_fd, backup_name = tempfile.mkstemp(
+            prefix=f".{executable_path.name}.bak.",
+            suffix=".tmp",
+            dir=str(executable_path.parent),
+        )
+        os.close(backup_fd)
+        backup_path = Path(backup_name)
         shutil.copy2(executable_path, backup_path)
 
     try:
@@ -675,13 +754,14 @@ def apply_update_script(executable_path: Path, new_script: str) -> None:
             os.chmod(executable_path, old_mode | 0o111)
         except (OSError, AttributeError, NotImplementedError):
             pass
-        backup_path.unlink(missing_ok=True)
+        if backup_path is not None:
+            backup_path.unlink(missing_ok=True)
     except Exception:
         try:
             tmp_path.unlink(missing_ok=True)
         except Exception:
             pass
-        if backup_path.exists():
+        if backup_path is not None and backup_path.exists():
             shutil.copy2(backup_path, executable_path)
             backup_path.unlink(missing_ok=True)
         raise
@@ -689,6 +769,7 @@ def apply_update_script(executable_path: Path, new_script: str) -> None:
 
 def check_for_updates() -> Tuple[bool, Optional[str], Optional[str]]:
     script = fetch_remote_extract()
+    validate_remote_checksum(script)
     if not validate_remote_script(script):
         raise RuntimeError("downloaded script validation failed")
     remote_version = extract_remote_version(script)
@@ -701,7 +782,7 @@ def check_for_updates() -> Tuple[bool, Optional[str], Optional[str]]:
 def run_self_update(executable_path: Path, silent: bool = False) -> Tuple[int, bool, Optional[str]]:
     try:
         has_update, remote_version, script = check_for_updates()
-    except (RuntimeError, urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (RuntimeError, urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError) as exc:
         if not silent:
             print(f"update check failed: {exc}", file=sys.stderr)
         return (1, False, None)
@@ -726,7 +807,7 @@ def run_self_update(executable_path: Path, silent: bool = False) -> Tuple[int, b
 def update_status() -> Tuple[str, bool]:
     try:
         has_update, remote_version, _script = check_for_updates()
-    except (RuntimeError, urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (RuntimeError, urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError) as exc:
         return (f"update check failed: {exc}", False)
 
     if has_update and remote_version is not None:
@@ -755,13 +836,13 @@ def maybe_auto_update(executable_path: Path, allow_auto_update: bool, config_aut
     if now - last_check < AUTO_UPDATE_INTERVAL_SECONDS:
         return
 
-    state["last_auto_update_check"] = now
-    try:
-        write_json_file(STATE_FILE, state)
-    except OSError:
-        pass
-
     result, updated, remote_version = run_self_update(executable_path, silent=True)
+    if result == 0:
+        state["last_auto_update_check"] = now
+        try:
+            write_json_file(STATE_FILE, state)
+        except OSError:
+            pass
     if result == 0 and updated and remote_version:
         print(f"extract auto-updated to {remote_version}; rerun to use new version", file=sys.stderr)
 
@@ -1148,14 +1229,18 @@ def human_size(size: int) -> str:
     return f"{value:.1f} PB"
 
 
-def count_lines(file_path: Path) -> int:
+def count_lines(file_path: Path, deadline: Optional[float] = None) -> int:
     try:
+        if deadline is not None and time.perf_counter() >= deadline:
+            raise TimeoutError
         with file_path.open("rb") as handle:
             count = 0
             chunk = handle.read(1024 * 1024)
             saw_data = False
             last_byte = None
             while chunk:
+                if deadline is not None and time.perf_counter() >= deadline:
+                    raise TimeoutError
                 saw_data = True
                 count += chunk.count(b"\n")
                 last_byte = chunk[-1]
@@ -1163,6 +1248,8 @@ def count_lines(file_path: Path) -> int:
             if saw_data and last_byte != 10:
                 count += 1
             return count
+    except TimeoutError:
+        raise
     except Exception:
         return 0
 
@@ -1209,23 +1296,36 @@ def git_markers(root: Path) -> Dict[str, str]:
             return markers
 
         result = subprocess.run(
-            ["git", "-C", str(root), "status", "--porcelain"],
+            ["git", "-C", str(root), "status", "--porcelain", "-z"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
             check=False,
             creationflags=_subprocess_flags,
         )
         if result.returncode != 0:
             return markers
 
-        for line in result.stdout.splitlines():
-            if len(line) < 4:
-                continue
-            status = line[:2]
-            path_part = line[3:]
-            if " -> " in path_part:
-                path_part = path_part.split(" -> ", 1)[1]
+        raw_output = result.stdout
+        index = 0
+        while index < len(raw_output):
+            if index + 3 > len(raw_output):
+                break
+            status = raw_output[index:index + 2].decode("ascii", errors="replace")
+            index += 3
+            end = raw_output.find(b"\0", index)
+            if end == -1:
+                break
+
+            path_part = raw_output[index:end].decode("utf-8", errors="surrogateescape")
+            index = end + 1
+
+            if "R" in status or "C" in status:
+                end2 = raw_output.find(b"\0", index)
+                if end2 == -1:
+                    break
+                path_part = raw_output[index:end2].decode("utf-8", errors="surrogateescape")
+                index = end2 + 1
+
             marker = ""
             if status == "??":
                 marker = "?"
@@ -1258,7 +1358,7 @@ def scan_tree(
     name = path.name
     extension = path.suffix.lower()
 
-    if path != root and config.ignore_hidden and name.startswith("."):
+    if path != root and config.ignore_hidden and not config.only_mode and name.startswith("."):
         stats.hidden += 1
         return None
 
@@ -1287,7 +1387,13 @@ def scan_tree(
         if config.ignore_empty and size == 0:
             return None
 
-        line_count = count_lines(path)
+        line_count = 0
+        if stat.S_ISREG(st.st_mode):
+            try:
+                line_count = count_lines(path, deadline)
+            except TimeoutError:
+                stats.timed_out = True
+                return None
         stats.files += 1
         stats.lines += line_count
         stats.size += size
@@ -1306,19 +1412,17 @@ def scan_tree(
     stats.dirs += 1 if path != root else 0
     node = Node(path=path, rel_path=rel_path, kind="dir", size=0, mtime=st.st_mtime)
 
+    children: List[Node] = []
     try:
-        entries = list(path.iterdir())
+        for child in path.iterdir():
+            if deadline is not None and time.perf_counter() >= deadline:
+                stats.timed_out = True
+                break
+            scanned = scan_tree(child, root, config, stats, deadline)
+            if scanned is not None:
+                children.append(scanned)
     except OSError:
         return node
-
-    children: List[Node] = []
-    for child in entries:
-        if deadline is not None and time.perf_counter() >= deadline:
-            stats.timed_out = True
-            break
-        scanned = scan_tree(child, root, config, stats, deadline)
-        if scanned is not None:
-            children.append(scanned)
 
     children.sort(key=lambda n: (0 if n.kind == "dir" else 1 if n.kind == "file" else 2, n.basename.lower()))
     node.children = children
@@ -1762,7 +1866,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument(
         "--config",
         dest="config_file",
-        help="Explicit path to config.yaml to load last (highest priority)",
+        help="Explicit path to config.yaml (overrides auto-discovery)",
     )
     parser.add_argument("--ignore", action="store_true", help="Enable ignore filters")
     parser.add_argument("--only", action="store_true", help="Show only the specified files/folders")
@@ -1782,7 +1886,10 @@ def main(argv: List[str]) -> int:
     target_is_valid_dir = provided_target.exists() and provided_target.is_dir()
 
     config_target = provided_target.resolve() if target_is_valid_dir else Path.cwd().resolve()
-    config_path = config_target / DEFAULT_CONFIG_FILE_NAME
+    config_write_path = resolve_config_write_path(config_target, args)
+    config_status_path = resolve_config_path(config_target, args)
+    if config_status_path is None:
+        config_status_path = config_write_path
 
     if args.version:
         print(f"extract {VERSION}")
@@ -1793,24 +1900,24 @@ def main(argv: List[str]) -> int:
         return 2
 
     if (args.enable_auto_update or args.disable_auto_update or args.auto_update_status) and not target_is_valid_dir:
-        if args.path != ".":
+        if args.path != "." and not getattr(args, "config_file", None):
             print(f"error: '{provided_target}' is not a valid directory", file=sys.stderr)
             return 1
 
     if args.enable_auto_update:
-        set_config_auto_update(config_path, True)
-        print(f"auto-update enabled in {config_path}")
+        set_config_auto_update(config_write_path, True)
+        print(f"auto-update enabled in {config_write_path}")
         return 0
 
     if args.disable_auto_update:
-        set_config_auto_update(config_path, False)
-        print(f"auto-update disabled in {config_path}")
+        set_config_auto_update(config_write_path, False)
+        print(f"auto-update disabled in {config_write_path}")
         return 0
 
     if args.auto_update_status:
         status_config = build_runtime_config(config_target, args)
         status = "enabled" if status_config.auto_update else "disabled"
-        print(f"auto-update is {status} ({config_path})")
+        print(f"auto-update is {status} ({config_status_path})")
         return 0
 
     if args.check_updates:

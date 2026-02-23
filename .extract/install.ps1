@@ -31,9 +31,14 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $ProjectRepo  = "omnious0o0/extract"
+$ReleaseDownloadBaseUrl = "https://github.com/$ProjectRepo/releases/latest/download"
 $SourceUrl    = if ($env:EXTRACT_SOURCE_URL) { $env:EXTRACT_SOURCE_URL } else {
-    "https://raw.githubusercontent.com/$ProjectRepo/main/extract"
+    "$ReleaseDownloadBaseUrl/extract"
 }
+$SourceSha256Url = if ($env:EXTRACT_SOURCE_SHA256_URL) { $env:EXTRACT_SOURCE_SHA256_URL } else {
+    "$ReleaseDownloadBaseUrl/extract.sha256"
+}
+$SourceSha256 = if ($env:EXTRACT_SOURCE_SHA256) { $env:EXTRACT_SOURCE_SHA256.Trim() } else { "" }
 $DefaultInstallDir = Join-Path $env:USERPROFILE ".local\bin"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -60,7 +65,7 @@ function Warn([string]$Message) {
 }
 
 function Die([string]$Message) {
-    Write-Host "[error] $Message" -ForegroundColor Red -Stream Error
+    Write-Error $Message
     exit 1
 }
 
@@ -91,7 +96,16 @@ function Resolve-InstallDir {
     $existing = (Get-Command "extract" -ErrorAction SilentlyContinue).Source
     if ($existing) {
         $existingDir = Split-Path $existing -Parent
-        if (Test-Path $existingDir) { return $existingDir }
+        if (Test-Path $existingDir) {
+            $probeFile = Join-Path $existingDir (".extract.write-probe." + [System.IO.Path]::GetRandomFileName())
+            try {
+                New-Item -ItemType File -Path $probeFile -Force | Out-Null
+                Remove-Item $probeFile -Force -ErrorAction SilentlyContinue
+                return $existingDir
+            } catch {
+                Remove-Item $probeFile -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
 
     return $DefaultInstallDir
@@ -99,18 +113,63 @@ function Resolve-InstallDir {
 
 # ── download ──────────────────────────────────────────────────────────────────
 
-function Download-Extract([string]$Destination) {
-    try {
-        $wc = New-Object System.Net.WebClient
-        $wc.Headers["User-Agent"] = "extract-installer/powershell"
-        $wc.DownloadFile($SourceUrl, $Destination)
-    } catch {
-        # Fallback: Invoke-WebRequest (slower but more universally available)
-        Invoke-WebRequest -Uri $SourceUrl -OutFile $Destination -UseBasicParsing
+function Download-File([string]$Url, [string]$Destination, [int]$TimeoutSec = 15, [int]$MaxAttempts = 3) {
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            Invoke-WebRequest -Uri $Url -OutFile $Destination -UseBasicParsing -TimeoutSec $TimeoutSec
+            return
+        } catch {
+            if ($attempt -eq $MaxAttempts) {
+                throw
+            }
+            Start-Sleep -Seconds 1
+        }
     }
 }
 
+function Download-Extract([string]$Destination) {
+    Download-File -Url $SourceUrl -Destination $Destination
+}
+
+function Download-Checksum([string]$Destination) {
+    Download-File -Url $SourceSha256Url -Destination $Destination
+}
+
 # ── validation ────────────────────────────────────────────────────────────────
+
+function Parse-ChecksumToken([string]$Value) {
+    if (-not $Value) {
+        return $null
+    }
+    $parts = $Value.Trim().Split([char[]]@(' ', "`t"), [System.StringSplitOptions]::RemoveEmptyEntries)
+    if ($parts.Count -eq 0) {
+        return $null
+    }
+    $token = $parts[0].Trim().ToLowerInvariant()
+    if ($token -match '^[0-9a-f]{64}$') {
+        return $token
+    }
+    return $null
+}
+
+function Validate-Checksum([string]$FilePath, [string]$ChecksumPath) {
+    $expected = Parse-ChecksumToken $SourceSha256
+    if (-not $expected) {
+        if (-not $ChecksumPath -or -not (Test-Path $ChecksumPath)) {
+            Die "Checksum metadata is required unless EXTRACT_SOURCE_SHA256 is set."
+        }
+        $line = Get-Content $ChecksumPath -TotalCount 1 -Encoding UTF8
+        $expected = Parse-ChecksumToken $line
+    }
+    if (-not $expected) {
+        Die "Downloaded checksum metadata is missing or invalid."
+    }
+
+    $actual = (Get-FileHash -Path $FilePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $expected) {
+        Die "Downloaded file checksum mismatch."
+    }
+}
 
 function Validate-Payload([string]$PythonExe, [string]$FilePath) {
     $lines = Get-Content $FilePath -TotalCount 5 -Encoding UTF8
@@ -175,9 +234,21 @@ if (-not (Test-Path $resolvedInstallDir)) {
 
 # Download to temp file
 $tmpDownload = [System.IO.Path]::GetTempFileName()
+$tmpChecksum = $null
+$tmpStaged = $null
 try {
     Info "Downloading extract from $SourceUrl"
     Download-Extract $tmpDownload
+
+    if ($SourceSha256) {
+        Info "Using pinned checksum from EXTRACT_SOURCE_SHA256"
+    } else {
+        $tmpChecksum = [System.IO.Path]::GetTempFileName()
+        Info "Downloading checksum metadata from $SourceSha256Url"
+        Download-Checksum $tmpChecksum
+    }
+
+    Validate-Checksum $tmpDownload $tmpChecksum
     Validate-Payload $pythonExe $tmpDownload
 
     # Stage inside install dir for atomic-ish move
@@ -221,6 +292,7 @@ try {
 
 } finally {
     if (Test-Path $tmpDownload) { Remove-Item $tmpDownload -Force -ErrorAction SilentlyContinue }
+    if ($tmpChecksum -and (Test-Path $tmpChecksum)) { Remove-Item $tmpChecksum -Force -ErrorAction SilentlyContinue }
     if ($tmpStaged -and (Test-Path $tmpStaged)) { Remove-Item $tmpStaged -Force -ErrorAction SilentlyContinue }
 }
 
