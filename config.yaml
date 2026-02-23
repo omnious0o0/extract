@@ -5,7 +5,7 @@ paths:
   - .svn
 
 # Optional type-level ignore list: file, dir, link
-types: {}
+types: []
 
 # Ignore by extension (include the leading dot)
 extensions:
@@ -65,15 +65,15 @@ ignore_hidden: true
 ignore_empty: false
 
 # Rendering controls
-# styling: full | low (recomended) | minimal (removes colors, NOT RECOMENDED)
+# styling: full | low (recommended) | minimal (removes colors)
 styling: low
-# show emojis: true | false (recomended)
-emojis: false
-# how much data to show: full (recomended) | medium | low | minimal
+# show emojis: true | false (recommended)
+scan_emojis: false
+# how much data to show: full (recommended) | medium | low | minimal
 scan_data: full
+scan_structure: dynamic
 
 # Runtime controls
 scan_timeout: 60 # seconds
-auto_update: true
+auto_update: false
 auto_copy: false # copy to clipboard after scan
-

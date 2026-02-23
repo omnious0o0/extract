@@ -1,6 +1,6 @@
 # extract
 
-A fast directory scanner that gives you and your AI agent a clean, readable tree with the context that actually matters: size, line count, last modified, file type, and more.
+A fast directory scanner that gives you and your AI agent a clean, readable tree with context that matters: size, line count, last modified, file type, and git markers.
 
 ## Example
 
@@ -33,95 +33,101 @@ A fast directory scanner that gives you and your AI agent a clean, readable tree
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**NOTE:** Don't worry, you can change the output styling and data amount to your liking in `config.yaml` to save tokens.
-
 ## Installation
 
-> **Requires Python 3.8+** — install it from [python.org](https://www.python.org/downloads/) if needed.
+> Requires Python 3.8+.
 
 ### Linux / macOS
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/omnious0o0/extract/main/.extract/install.sh | bash
+curl -fsSL -o install.sh https://raw.githubusercontent.com/omnious0o0/extract/main/.extract/install.sh
+bash install.sh
+rm -f install.sh
 ```
 
 ### Windows (PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/omnious0o0/extract/main/.extract/install.ps1 | iex
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/omnious0o0/extract/main/.extract/install.ps1" -OutFile "install.ps1"
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+Remove-Item .\install.ps1
 ```
 
-This automatically:
-- Downloads the `extract` script
-- Creates an `extract.bat` launcher so you can run `extract` directly from CMD or PowerShell
-- Adds the install directory to your user `PATH`
-
-To install into a custom directory:
-```powershell
-.\install.ps1 -InstallDir C:\tools\extract
-```
+The installers download release artifacts (`extract` + `extract.sha256`) and verify the SHA-256 checksum before install.
 
 ## Usage
 
 ```bash
-extract <path/to/directory> # or . for current directory
+extract [path]
 ```
 
-### Filtering
-```bash
---ignore -f path, path, ... -t type, type, ... -e extension, extension, ... -n name, name, ...
-# path: ignore specific files/folders by path
-# type: ignore specific types (file, dir, link)
-# extension: ignore specific extensions (e.g. .git)
-# name: ignore specific names (e.g. node_modules)
+### Common options
 
-# Replace --ignore with --only to show only the specified files/folders
-```
-
-**Show everything** (including anything blocked by config):
 ```bash
+--version
+--check-updates
+--self-update
+--enable-auto-update
+--disable-auto-update
+--auto-update-status
+--no-auto-update
+--install-bat [DIR]          # Windows launcher helper
+--config <path/to/config.yaml>
+--styling-mode full|low|minimal
+--scan-emojis true|false
+--scan-data full|medium|low|minimal
+--scan-structure dynamic|static
 --full
 ```
 
-## config.yaml
+### Filtering
 
-Stop retyping flags every time. Setting up `config.yaml` is highly recommended to tune `extract` to your exact workflow needs. It supports deep customization for styling, ignored paths, and rendering details:
+```bash
+-f, --paths path1,path2,...          # match relative paths
+-t, --types file,dir,link            # match node kinds
+-e, --extensions .py,.ts,...         # match file extensions
+-n, --names node_modules,.git,...    # match basenames
+```
+
+- Ignore mode uses config ignore rules plus CLI selectors.
+- `--ignore` is optional when rules are present.
+- `--only` shows only matching entries and bypasses ignore + hidden filtering.
+- `--full` bypasses all ignore and visibility filters.
+
+## config.yaml
 
 ```yaml
 paths:
-  - path
+  - .git
 types: []
 extensions: []
 names: []
 
-# File visibility controls
 ignore_hidden: true
 ignore_empty: false
+
+styling: low
+scan_emojis: false
+scan_data: full
+scan_structure: dynamic
+
+scan_timeout: 60
+auto_update: false
+auto_copy: false
 ```
 
-**Other settings:**
-```yaml
-styling: low          # full | low (recommended) | minimal (removes colors, NOT RECOMMENDED)
-emojis: false         # true | false (recommended)
-scan_data: full       # full (recommended) | medium | low | minimal
+Notes:
+- If no config file is found, common noisy folders/files are ignored by default.
+- Config discovery order: explicit `--config`, target directory, executable directory, global config directory.
 
-scan_timeout: 60      # seconds
-auto_update: true
-auto_copy: false      # copy to clipboard after scan
-```
+## Security notes
 
-> By default, hidden and common files/folders are ignored. Edit `config.yaml` to change this.
+- Self-update validates checksum metadata before replacing the installed script.
+- For controlled environments, pin updates with `EXTRACT_SOURCE_SHA256`.
 
 ## Support
 
-If you liked extract, please consider starring the repo and dropping me a follow for more stuff like this :)
-It takes less than a minute and helps a lot ❤️
-
-If you want to show extra love, consider *[buying me a coffee](https://buymeacoffee.com/specter0o0)*! ☕
-
-**RECOMMENDED:** Check out [commands-wrapper](https://github.com/omnious0o0/commands-wrapper) you and your agent will love it!
-
-[![Buy Me a Coffee](https://imgs.search.brave.com/FolmlC7tneei1JY_QhD9teOLwsU3rivglA3z2wWgJL8/rs:fit:860:0:0:0/g:ce/aHR0cHM6Ly93aG9w/LmNvbS9ibG9nL2Nv/bnRlbnQvaW1hZ2Vz/L3NpemUvdzIwMDAv/MjAyNC8wNi9XaGF0/LWlzLUJ1eS1NZS1h/LUNvZmZlZS53ZWJw)](https://buymeacoffee.com/specter0o0)
+Open an issue or pull request for bugs, regressions, or feature requests.
 
 ## License
 
